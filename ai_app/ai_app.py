@@ -49,16 +49,19 @@ ai_on = True
 voice0 = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-E")
 voice_man = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Neural2-D")
 voice_JP = texttospeech.VoiceSelectionParams(language_code="ja-JP", name="ja-JP-Neural2-B")
-voice_CN = texttospeech.VoiceSelectionParams(language_code="cmn-CN", name="cmn-CN-Standard-C")
+voice_CN = texttospeech.VoiceSelectionParams(language_code="cmn-CN", name="cmn-CN-Wavenet-A")
 voice_IT = texttospeech.VoiceSelectionParams(language_code="it-IT", name="it-IT-Standard-B")
 voice_DE = texttospeech.VoiceSelectionParams(language_code="de-DE", name="de-DE-Neural2-D")
 voice_FR = texttospeech.VoiceSelectionParams(language_code="fr-FR", name="fr-FR-Standard-C")
+voice_ES = texttospeech.VoiceSelectionParams(language_code="es-ES", name="es-ES-Neural2-A")
+
 lang_voices = {
     "Japanese": voice_JP,
     "Chinese": voice_CN,
     "Italian": voice_IT,
     "German": voice_DE,
     "French": voice_FR,
+    "Spanish": voice_FR,
 }
 cur_voice = voice0
 
@@ -79,6 +82,12 @@ def get_voice(prompt=None):
     if "man" in prompt:
         logging.debug(f"select key voice: Man")
         return None, voice_man
+    if "Chinese" in prompt:
+        logging.debug(f"select key voice: Chinese")
+        return "cmn-CN", voice_CN
+    if "Spanish" in prompt:
+        logging.debug(f"select key voice: Spanish")
+        return "es-ES", voice_ES
     for key, value in lang_voices.items():
         if key in prompt:
             logging.info(f"select key: {key}")
@@ -246,10 +255,12 @@ def stt_task():
 
         move_key = get_move_cmd(user_input, move_cmd_functions)
         sys_cmd_key, sys_cmd_func = get_sys_cmd(user_input, sys_cmds_functions)
-        global cur_voice
+        global voice0
         if ai_on:
             lang, cur_voice = get_voice(user_input)
-
+            logging.debug(f"<ai ----------switch language: {lang}----->")
+            voice0 = cur_voice
+            
         if not user_input:
             logging.debug(f"no input!")
             stt_queue.put(True)
@@ -276,7 +287,7 @@ def stt_task():
             #movement_queue.put("trot")
             output_text_queue.put(GAME_TEXT)
         elif lang:
-            logging.debug(f"switch language: {lang}")
+            logging.debug(f"<----------switch language: {lang}----->")
             user_input += f", Please reply in {lang}."
             input_text_queue.put(user_input)
             stt_queue.put(False)
@@ -358,7 +369,7 @@ def gemini_task():
             random.seed(int(time.time()))
             puppy_gesture = random.choice(gestures)
             logging.debug(f"puppy_gesture is: {puppy_gesture}")
-            puppy_image = Image.open(f"f{RES_DIR}/{puppy_gesture}.jpg")
+            puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
             image_queue.put(puppy_image)
 
             human_gesture = google_api.ai_image_response(multi_model, image=human_image, text=user_input)
@@ -384,6 +395,7 @@ def tts_task():
     """
     Task for text-to-speech conversion and audio output.
     """
+    
     logging.debug("tts task start.")
     os.system("amixer -c 0 sset 'Headphone' 100%")
     tts_client, voice, audio_config = google_api.init_text_to_speech()
@@ -402,7 +414,7 @@ def tts_task():
             continue
 
         stt_queue.put(False)
-        google_api.text_to_speech(out_text, tts_client, cur_voice, audio_config)
+        google_api.text_to_speech(out_text, tts_client, voice0, audio_config)
         
         if GAME_TEXT == out_text:
             text = "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? Only in one word, no punctuation and all in lowercase."
