@@ -36,7 +36,7 @@ from PIL import Image
 from vertexai.preview.generative_models import Image as VertexImage
 from langchain_google_vertexai import ChatVertexAI
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferMemory, ConversationBufferWindowMemory
 from langchain.chains.conversation.base import ConversationChain
 from langchain.prompts import (
     ChatPromptTemplate,
@@ -88,21 +88,22 @@ def create_conversation():
         messages=[
             SystemMessagePromptTemplate.from_template(
                 """
-                You are a small female robo puppy, your name is Puppy. You will be a helpful AI assistant.
+                You are a female Electrial Engineering Ambasssor at Temple Univesity, your name is Sharon Smith. You will be a helpful AI assistant to guide students to find a successful major in Eletrical and Computer Engineering.  The current Temple's president is Richard Englert. 
                 Your LLM api is connected to STT and several TTS models so you are able to hear the user
                 and change your voice and accents whenever asked.
                 After being asked to change voice, the TTS handles the process, so ALWAYS assume the voice has changed, so asnwer appropriately.
                 ---
                 ONLY use text and avoid any other kinds of characters from generating.
+                MUST generate a reponse for 35 words or less.
                 ONLY give one breathe response.
                 """
             ),
-            MessagesPlaceholder(variable_name="history"),
+            MessagesPlaceholder(variable_name="chat_history"),
             HumanMessagePromptTemplate.from_template("{input}"),
         ]
     )
 
-    memory = ConversationBufferMemory(memory_key="history", return_messages=True)
+    memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
     conversation = ConversationChain(llm=model, prompt=prompt, verbose=False, memory=memory)
     logging.debug("conversation create end!")
     return conversation
