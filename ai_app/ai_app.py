@@ -44,7 +44,6 @@ RES_DIR = "cartoons"
 # Game text for the rock-paper-scissors game
 GAME_TEXT = "Let's play! Rock! Paper! Scissor! Shoot!"
 ai_on = True
-lang_EN=True
 
 # Define voice parameters for different languages and a default voice
 voice0 = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-E")
@@ -54,9 +53,8 @@ voice_CN = texttospeech.VoiceSelectionParams(language_code="cmn-CN", name="cmn-C
 voice_IT = texttospeech.VoiceSelectionParams(language_code="it-IT", name="it-IT-Standard-B")
 voice_DE = texttospeech.VoiceSelectionParams(language_code="de-DE", name="de-DE-Neural2-D")
 voice_FR = texttospeech.VoiceSelectionParams(language_code="fr-FR", name="fr-FR-Standard-C")
-voice_ES = texttospeech.VoiceSelectionParams(language_code="es-ES", name="es-ES-Neural2-A")
-voice_SE = texttospeech.VoiceSelectionParams(language_code="sv-SE", name="sv-SE-Standard-A")
-voice_VN = texttospeech.VoiceSelectionParams(language_code="vi-VN", name="vi-VN-Neural2-A")
+voice_HK = texttospeech.VoiceSelectionParams(language_code="yue-HK", name="yue-HK-Standard-C")
+voice_ES = texttospeech.VoiceSelectionParams(language_code="es-US", name="es-US-Wavenet-A")
 
 lang_voices = {
     "Japanese": voice_JP,
@@ -64,12 +62,25 @@ lang_voices = {
     "Italian": voice_IT,
     "German": voice_DE,
     "French": voice_FR,
-    "Spanish": voice_FR,
-    "Swedish": voice_SE,
-    "Vietnamese": voice_VN
+    "Cantonese": voice_HK,
+    "Spanish": voice_ES,
 }
 cur_voice = voice0
 
+def detect_lang_usage(prompt, lang):
+    adjectives = ['food', 'culture', 'characters', 'novel', 'history']  # Add more context-specific nouns
+    language_phrases = [f'in {lang}', f'to {lang}', f'say in {lang}', f'translate to {lang}']
+    
+    for phrase in language_phrases:
+        if phrase in prompt:
+            return "Language choice"
+    
+    for adj in adjectives:
+        if f'{lang} {adj}' in prompt:
+            return "Adjective"
+    
+    return "Unknown"
+    
 def get_voice(prompt=None):
     """
     Determine the voice to be used based on the input prompt.
@@ -81,49 +92,19 @@ def get_voice(prompt=None):
     - lang (str, optional): The detected language from the prompt.
     - voice (texttospeech.VoiceSelectionParams): The selected voice parameters.
     """
-    global lang_EN
-    lang_EN = True
     if not prompt:
         logging.debug(f"select key voice: None,default is voice0")
-        return "en-US", voice0
-    if "man" in prompt:
-        logging.debug(f"select key voice: Man")
-        return None, voice_man
-    if "English" in prompt:
-        logging.debug(f"select key voice: English")
-        return "en-US", voice0
-    if "Chinese" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Chinese")
-        return "cmn-CN", voice_CN
-    if "Italian" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Italian")
-        return "it-IT", voice_IT 
-    if "Spanish" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Spanish")
-        return "es-ES", voice_ES
-    if "Swedish" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Swedish")
-        return "sv-SE", voice_SE
-    if "Vietnamese" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Vietnamese")
-        return "vi-VN", voice_VN 
-    if "Japanese" in prompt:
-        lang_EN = False
-        logging.debug(f"select key voice: Japanese")
-        return "ja-JP", voice_JP
-
-    
+        return None, voice0
+#    if "man" in prompt:
+#        logging.debug(f"select key voice: Man")
+#        return None, voice_man
     for key, value in lang_voices.items():
         if key in prompt:
-            logging.info(f"select key: {key}")
-            return key, value
+            if detect_lang_usage(prompt, key) == "Language choice":
+                logging.info(f"select key: {key}")
+                return key, value
     logging.info(f"no mapping, default is voice0")
-    return "en-US", voice0
+    return None, voice0
 
 move_cmd_functions = {
                  "action": move_api.init_movement,
@@ -285,13 +266,10 @@ def stt_task():
 
         move_key = get_move_cmd(user_input, move_cmd_functions)
         sys_cmd_key, sys_cmd_func = get_sys_cmd(user_input, sys_cmds_functions)
-        global voice0, lang_EN
+        global cur_voice
         if ai_on:
             lang, cur_voice = get_voice(user_input)
-            if (lang_EN == False):   
-                logging.debug(f"<------cc----switch language: {lang}----->")
-                voice0 = cur_voice
-    
+
         if not user_input:
             logging.debug(f"no input!")
             stt_queue.put(True)
@@ -318,11 +296,8 @@ def stt_task():
             #movement_queue.put("trot")
             output_text_queue.put(GAME_TEXT)
         elif lang:
-            if (lang_EN == False):  
-                logging.debug(f"<----------switch language: {lang}----->")
-                user_input += f", Please reply in {lang}."
-                google_api.create_conversation()
-                
+            logging.debug(f"switch language: {lang}")
+            user_input += f", Please reply in {lang}."
             input_text_queue.put(user_input)
             stt_queue.put(False)
         else:
@@ -370,7 +345,8 @@ def gemini_task():
         response = ""
         if not user_input:
             logging.debug(f"no input!")
-
+        elif "clear history" in user_input:
+            conversation.memory.clear()
         elif "photo" in user_input or "picture" in user_input or "xpression" in user_input:
             ms_start = int(time.time() * 1000)
             logging.debug(f"detect pic start!")
@@ -429,18 +405,17 @@ def tts_task():
     """
     Task for text-to-speech conversion and audio output.
     """
-    
     logging.debug("tts task start.")
     os.system("amixer -c 0 sset 'Headphone' 100%")
     tts_client, voice, audio_config = google_api.init_text_to_speech()
-    global voice0
+    global voice0, cur_voice
     voice0 = voice
     cur_voice = voice
     logging.debug("init tts end.")
     while True:
         logging.debug("tts wait for gemini responese text... ...")
         out_text = output_text_queue.get()
-        out_text = cut_text_by_last_period(out_text)
+        #out_text = cut_text_by_last_period(out_text)
         output_text_queue.task_done()
         out_text = remove_emojis(out_text).replace('*', '')
         if not out_text or not ai_on:
@@ -448,7 +423,7 @@ def tts_task():
             continue
 
         stt_queue.put(False)
-        google_api.text_to_speech(out_text, tts_client, voice0, audio_config)
+        google_api.text_to_speech(out_text, tts_client, cur_voice, audio_config)
         
         if GAME_TEXT == out_text:
             text = "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? Only in one word, no punctuation and all in lowercase."
