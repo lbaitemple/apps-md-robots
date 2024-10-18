@@ -51,6 +51,7 @@ from google.cloud import speech
 from google.cloud import texttospeech
 from io import BytesIO
 import asyncio
+import json
 
 
 # language code and name, default is en-US
@@ -72,7 +73,13 @@ def init_credentials(key_json_path):
     credentials, project_id = google.auth.default()
     return credentials, project_id
 
-def create_conversation():
+def load_history(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, 'r') as f:
+            return json.load(f)
+    return []
+    
+def create_conversation(history_file_path=''):
     """
     Creates an instance of ConversationChain for AI interactions.
 
@@ -104,6 +111,15 @@ def create_conversation():
     )
 
     memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
+    if (history_file_path != ''):
+        history = load_history(history_file_path)
+        # Populate memory with loaded history
+        for message in history:
+            if message['role'] == 'user':
+                memory.chat_memory.add_user_message(message['content'])
+            elif message['role'] == 'ai':
+                memory.chat_memory.add_ai_message(message['content'])  
+                
     conversation = ConversationChain(llm=model, prompt=prompt, verbose=False, memory=memory)
     logging.debug("conversation create end!")
     return conversation
