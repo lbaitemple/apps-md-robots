@@ -86,24 +86,36 @@ def create_conversation(history_file_path=''):
     Returns:
     - conversation (ConversationChain): The conversation object initialized with the AI model and prompt template.
     """
+
+    hist_txt =""
+    if (history_file_path != ''):
+        history = load_history(history_file_path)
+        # Populate memory with loaded history
+        for message in history:
+            if message['role'] == 'user':
+                hist_txt = message['content']
+                
+
     model = ChatVertexAI(
         model_name='gemini-pro',
         convert_system_message_to_human=True,
     )
 
+    
+    logging.debug(f"{hist_txt}")
     prompt = ChatPromptTemplate(
         messages=[
             SystemMessagePromptTemplate.from_template(
                 """
-                You are a small female robo puppy, your name is Puppy. You will be a helpful AI assistant.
+                You are a small female robo puppy, your name is Puppy. {}. You will be a helpful AI assistant.
                 Your LLM api is connected to STT and several TTS models so you are able to hear the user
                 and change your voice and accents whenever asked.
                 After being asked to change voice, the TTS handles the process, so ALWAYS assume the voice has changed, so asnwer appropriately.
                 ---
                 ONLY use text and avoid any other kinds of characters from generating.
-                MUST generate a reponse for 35 words or less.
+                MUST generate a reponse for 35 words or less. Your MUST condense a list to 20 words if you have one.
                 ONLY give one breathe response.
-                """
+                """.format(hist_txt)
             ),
             MessagesPlaceholder(variable_name="chat_history"),
             HumanMessagePromptTemplate.from_template("{input}"),
@@ -111,15 +123,6 @@ def create_conversation(history_file_path=''):
     )
 
     memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
-    if (history_file_path != ''):
-        history = load_history(history_file_path)
-        # Populate memory with loaded history
-        for message in history:
-            if message['role'] == 'user':
-                memory.chat_memory.add_user_message(message['content'])
-            elif message['role'] == 'ai':
-                memory.chat_memory.add_ai_message(message['content'])  
-                
     conversation = ConversationChain(llm=model, prompt=prompt, verbose=False, memory=memory)
     logging.debug("conversation create end!")
     return conversation
