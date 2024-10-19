@@ -314,7 +314,9 @@ def gemini_task():
     Task for handling Gemini AI interactions.
     """
     logging.debug("gemini task start.")
-    conversation = google_api.create_conversation()
+    history_file_path = "res/ece_history.json"
+    conversation = google_api.create_conversation(history_file_path)
+
     init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breathe responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
     response = google_api.ai_text_response(conversation, init_input)
     logging.debug(f"init llm and first response: {response}")
