@@ -1,7 +1,6 @@
 python-dotenv
 sounddevice
 soundfile
-opencv-python==4.10.0.84
 opencv-contrib-python
 opencv-python-headless
 pyaudio
@@ -10,3 +9,4 @@ google-cloud-texttospeech
 google-cloud-speech
 langchain
 langchain-google-vertexai
+opencv-python==4.10.0.84
