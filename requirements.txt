@@ -1,8 +1,8 @@
 python-dotenv
 sounddevice
 soundfile
-opencv-contrib-python
-opencv-python-headless
+opencv-contrib-python==4.10.0.84
+opencv-python-headless==4.10.0.84
 pyaudio
 google-auth
 google-cloud-texttospeech
