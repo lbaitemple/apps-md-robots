@@ -32,12 +32,14 @@ import threading
 from google.cloud import texttospeech
 from langchain_google_vertexai import ChatVertexAI
 import random
-
+import vertexai
+from vertexai.generative_models import GenerativeModel
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from task_queue import input_text_queue, output_text_queue, gif_queue, image_queue, movement_queue, stt_queue
 from api import media_api, google_api, move_api, shell_api
-
+from google import genai
+from google.genai.types import HttpOptions
 
 RES_DIR = "cartoons"
 
@@ -313,15 +315,33 @@ def gemini_task():
     """
     Task for handling Gemini AI interactions.
     """
+    #from vertexai.generative_models import GenerativeModel
     logging.debug("gemini task start.")
+
     history_file_path = "res/ece_history.json"
     conversation = google_api.create_conversation(history_file_path)
-
     init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breathe responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
+
+"""    
     response = google_api.ai_text_response(conversation, init_input)
     logging.debug(f"init llm and first response: {response}")
+    vertexai.init(project="minipupper-436416", location="us-central1")
+    #multi_model = ChatVertexAI(model="gemini-pro-vision")
+    multi_model = GenerativeModel("gemini-2.0-flash-001")
+    ##multi_model = GenerativeModel("chat-bison")
 
-    multi_model = ChatVertexAI(model="gemini-pro-vision")
+    init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breathe responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
+    client = genai.Client(http_options=HttpOptions(api_version="v1"))
+    response = client.models.generate_content(
+        model="gemini-2.0-flash-001",
+        contents=init_input,
+    )
+    """
+    text_model = google_api.init_text_model()
+    response = google_api.ai_text_response(text_model, init_input, conversation)
+
+
+
     with Image.open(f"{RES_DIR}/Trot.jpg") as image:
         logging.debug(f"Opened image: 320p")
         if image is None:
