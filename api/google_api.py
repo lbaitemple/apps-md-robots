@@ -1,247 +1,138 @@
-#
-# Copyright 2024 MangDang (www.mangdang.net)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Description: This Python script is designed to handle various AI-driven tasks, including text-based conversations,
-# speech recognition (speech-to-text), and speech synthesis (text-to-speech). It integrates Google Cloud services and other libraries to accomplish these tasks.
-#
-# Gemini Test Method: type 'text' followed by a ' ' (space), and the text you want to type, then press enter.
-# Gemini Visio Pro Test method: type 'image' followed by a ' ' (space), and the text you want to type, then press enter.
-# Speech-T-Text Test method: type 'text'. After pressing enter, start speaking, then press enter.
-# Text-To-Speech Test method: type 'text' followed by a ' ' (space), and the text you want to type, then press enter.
-#
-# References: https://python.langchain.com/v0.1/docs/integrations/llms/google_vertex_ai_palm/
-#             https://cloud.google.com/speech-to-text/docs
-#             https://cloud.google.com/text-to-speech/docs
-#
+# Revised google_api.py using Gemini GenAI SDK
+# Maintains STT, TTS, and image support with conversation support
 
-import logging
 import os
-import base64
 import time
+import base64
+import logging
 import numpy as np
-import google.auth
+import google.generativeai as genai
 from PIL import Image
-from vertexai.preview.generative_models import Image as VertexImage
-from langchain_google_vertexai import ChatVertexAI
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain.memory import ConversationBufferMemory, ConversationBufferWindowMemory
-from langchain.chains.conversation.base import ConversationChain
-from langchain.prompts import (
-    ChatPromptTemplate,
-    HumanMessagePromptTemplate,
-    MessagesPlaceholder,
-    SystemMessagePromptTemplate,
-)
+from io import BytesIO
+import json
+
 import pyaudio
 import sounddevice as sd
 import soundfile as sf
 from google.cloud import speech
 from google.cloud import texttospeech
-from io import BytesIO
-import asyncio
-import json
 
+from dotenv import load_dotenv
 
-# language code and name, default is en-US
-language_code = "en-US"
-language_name = "en-US-Standard-E"
+# Language settings
+default_language_code = "en-US"
+default_language_name = "en-US-Standard-E"
+language_code = default_language_code
+language_name = default_language_name
 
-def init_credentials(key_json_path):
-    """
-    Initializes Google Cloud credentials by setting the environment variable.
+# Initialize credentials and configure GenAI
 
-    Parameters:
-    - key_json_path (str): The file path to the Google Cloud credentials JSON file.
-
-    Returns:
-    - credentials: The credentials object for Google Cloud authentication.
-    - project_id: The project ID associated with the provided credentials.
-    """
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_json_path
-    credentials, project_id = google.auth.default()
-    return credentials, project_id
-
-def load_history(file_path):
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as f:
-            return json.load(f)
-    return []
-    
-def create_conversation(history_file_path=''):
-    """
-    Creates an instance of ConversationChain for AI interactions.
-
-    Returns:
-    - conversation (ConversationChain): The conversation object initialized with the AI model and prompt template.
-    """
-
-    hist_txt =""
-    if (history_file_path != ''):
-        history = load_history(history_file_path)
-        # Populate memory with loaded history
-        for message in history:
-            if message['role'] == 'user':
-                hist_txt = message['content']
-                
-
-    model = ChatVertexAI(
-        model_name='gemini-pro',
-        convert_system_message_to_human=True,
-    )
-
-    
-    logging.debug(f"{hist_txt}")
-    prompt = ChatPromptTemplate(
-        messages=[
-            SystemMessagePromptTemplate.from_template(
-                """
-                You are a small female robo puppy, your name is Puppy. {}. You will be a helpful AI assistant.
-                Your LLM api is connected to STT and several TTS models so you are able to hear the user
-                and change your voice and accents whenever asked.
-                After being asked to change voice, the TTS handles the process, so ALWAYS assume the voice has changed, so asnwer appropriately.
-                ---
-                ONLY use text and avoid any other kinds of characters from generating.
-                MUST generate a reponse for 35 words or less. Your MUST condense a list to 20 words if you have one.
-                ONLY give one breathe response.
-                """.format(hist_txt)
-            ),
-            MessagesPlaceholder(variable_name="chat_history"),
-            HumanMessagePromptTemplate.from_template("{input}"),
-        ]
-    )
-
-    memory = ConversationBufferWindowMemory(memory_key="chat_history", return_messages=True, k=5)
-    conversation = ConversationChain(llm=model, prompt=prompt, verbose=False, memory=memory)
-    logging.debug("conversation create end!")
-    return conversation
-
-def ai_text_response(conversation, input_text):
-    """
-    Generates a text response from the AI model based on the input text.
-
-    Parameters:
-    - conversation (ConversationChain): The conversation object containing the AI model state.
-    - input_text (str): The text input to be processed by the AI model.
-
-    Returns:
-    - result (str): The text response generated by the AI model.
-    """
-    logging.debug("ai_text_response start!")
-    ms_start = int(time.time() * 1000)
-
-    result = conversation.invoke(input=input_text)
-
-    logging.debug(f"ai_text_response response: {result}")
-    result = result['response']
-    logging.debug(f"text response: {result}")
-    ms_end = int(time.time() * 1000)
-    logging.debug(f"ai_text_response end, delay = {ms_end - ms_start}ms")
-    return result
-
-def ai_image_response(llm, image, text):
-    """
-    Generates a response from the AI model based on the provided image and text.
-
-    Parameters:
-    - llm (ChatVertexAI): The AI model instance for processing images.
-    - image (PIL.Image): The image object to be processed.
-    - text (str): The accompanying text for the image.
-
-    Returns:
-    - result (str): The text response generated by the AI model.
-    """
-    logging.debug("ai_image_response start!")
-    ms_start = int(time.time() * 1000)
-
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    image_bytes = buffered.getvalue()
-
-    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-    image_data_url = f"data:image/jpeg;base64,{image_base64}"
-
-    image_message = {
-        "type": "image_url",
-        "image_url": {
-            "url": image_data_url
-        }
-    }
-    text_message = {"type": "text", "text": text}
-
-    message = HumanMessage(content=[text_message, image_message])
-
-    output = llm.invoke([message])
-
-    #logging.debug(f"ai_image_response response: {output}")
-    result = output.content
-    logging.debug(f"text response: {result}")
-    ms_end = int(time.time() * 1000)
-    logging.debug(f"ai_image_response end, delay = {ms_end - ms_start}ms")
-    return result
+def init_credentials(api_key: str):
+    genai.configure(api_key=api_key)
 
 def set_language(code, name):
-    """
-    set the default languange for stt and tts.
-
-    Parameters:
-    - code (String): The language code.
-    - name (String): The language name.
-
-    Reference: https://cloud.google.com/text-to-speech/docs/voices
-    """
-
     global language_code, language_name
     language_code = code
     language_name = name
 
-def init_pyaudio():
-    """
-    Initializes the PyAudio library for handling audio streams.
+# Initialize models
 
-    Returns:
-    - p (pyaudio.PyAudio): The PyAudio instance ready for audio I/O operations.
-    """
-    p = pyaudio.PyAudio()
-    return p
+def init_text_model():
+    return genai.GenerativeModel("gemini-2.0-flash-001")
+
+def init_vision_model():
+    return genai.GenerativeModel("gemini-2.0-flash-001")
+
+
+# AI response functions
+def ai15_text_response(model, prompt: str, conversation=None) -> str:
+    if not hasattr(model, 'generate_content'):
+        raise TypeError("Expected a GenAI model as the first argument.")
+
+    contents = []
+
+    if conversation and "history" in conversation and len(conversation["history"]) > 0:
+        for entry in conversation["history"]:
+            contents.append({"role": "user", "parts": [entry["user"]]})
+            contents.append({"role": "model", "parts": [entry["ai"]]})
+
+    # Always add the new prompt from user
+    contents.append({"role": "user", "parts": [prompt]})
+
+    # 👇 Correct call for Gemini 1.5 Pro
+    response = model.generate_content(contents=contents)
+
+    reply = response.candidates[0].content.parts[0].text.strip()
+
+    # Save history for future turns
+    if conversation and "history" in conversation:
+        conversation["history"].append({"user": prompt, "ai": reply})
+
+    return reply
+
+def ai_text_response(model, prompt: str, conversation=None) -> str:
+    if not hasattr(model, 'generate_content'):
+        raise TypeError("Expected a GenAI model as the first argument.")
+
+    # Build conversation text manually
+    history_text = ""
+    if conversation and "history" in conversation and len(conversation["history"]) > 0:
+        for entry in conversation["history"]:
+            history_text += f"User: {entry['user']}\nAI: {entry['ai']}\n"
+
+    # Add new user prompt
+    full_prompt = f"{history_text}User: {prompt}\nAI:"
+
+    # Gemini 2.0 Flash expects simple prompt
+    response = model.generate_content([full_prompt])
+    reply = response.text.strip()
+
+    # Save this turn
+    if conversation and "history" in conversation:
+        conversation["history"].append({"user": prompt, "ai": reply})
+
+    return reply
+
+
+def ai_image_response(model, image: Image.Image, text: str) -> str:
+    buffered = BytesIO()
+    image.save(buffered, format="JPEG")
+    image_bytes = buffered.getvalue()
+    response = model.generate_content([text, image_bytes])
+    return response.text.strip()
+
+# Conversation support using simple in-memory history
+
+
+def create_conversation(history_file_path=''):
+    conversation = {"history": []}
+
+    if history_file_path and os.path.exists(history_file_path):
+        with open(history_file_path, 'r') as f:
+            history = json.load(f)
+            for message in history:
+                if 'user' in message and 'ai' in message:
+                    conversation["history"].append(message)
+
+    return conversation
+
+def save_conversation(conversation, file_path):
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(conversation["history"], f, indent=2)
+        logging.info(f"Conversation saved to {file_path}")
+    except Exception as e:
+        logging.error(f"Failed to save conversation: {e}")
+
+# PyAudio and Speech-to-Text functions
+
+def init_pyaudio():
+    return pyaudio.PyAudio()
 
 def init_speech_to_text():
-    """
-    Initializes the Google Cloud Speech-to-Text client for audio transcription.
+    return speech.SpeechClient()
 
-    Returns:
-    - speech_client (speech.SpeechClient): The initialized Speech-to-Text client.
-    """
-    speech_client = speech.SpeechClient()
-    return speech_client
-
-# Note:  Very important!!!
-# After you called this function start_speech_to_text(), You need to call stop_speech_to_text() some time later, not immediately because it will crash
-# Function to detect voice and transribe speech
 def start_speech_to_text(speech_client, py_audio):
-    """
-    Starts the speech-to-text process to transcribe audio input to text.
-
-    Parameters:
-    - speech_client (speech.SpeechClient): The initialized Speech-to-Text client.
-    - py_audio (pyaudio.PyAudio): The PyAudio instance for handling audio streams.
-
-    Returns:
-    - user_input (str): The transcribed text from the audio input.
-    - stream: The audio stream used for the transcription process.
-    """
-
     RATE = 48000
     CHUNK = int(RATE / 10)
 
@@ -250,210 +141,143 @@ def start_speech_to_text(speech_client, py_audio):
             while True:
                 data = stream.read(chunk)
                 if not data:
-                    # End of stream, break out of the loop
                     break
                 yield data
         except Exception as e:
-            # Handle any exceptions that may occur while reading from the stream
             logging.error(f"Error reading from audio stream: {e}")
-            # You may want to close the stream or return a signal to indicate an error
             yield None
 
-
     stream = py_audio.open(format=pyaudio.paInt16,
-                    channels=2,
-                    rate=RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
+                           channels=2,
+                           rate=RATE,
+                           input=True,
+                           frames_per_buffer=CHUNK)
 
-    requests = (speech.StreamingRecognizeRequest(audio_content=content) for content in audio_generator(stream, CHUNK) if content)
+    requests = (speech.StreamingRecognizeRequest(audio_content=content)
+                for content in audio_generator(stream, CHUNK) if content)
+
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=RATE,
+        language_code=language_code,
+        use_enhanced=True,
+        model="phone_call",
+        audio_channel_count=2,
+        enable_separate_recognition_per_channel=True,
+    )
 
     streaming_config = speech.StreamingRecognitionConfig(
-        config=speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=RATE,
-            language_code=language_code,
-            use_enhanced=True,
-            model="phone_call",
-            audio_channel_count=2,
-            enable_separate_recognition_per_channel=True,
-        ),
-        interim_results=True
-    )
+        config=config, interim_results=True)
+
     responses = speech_client.streaming_recognize(config=streaming_config, requests=requests)
 
     user_input = ""
-    should_break=False
     for response in responses:
         for result in response.results:
-            if result.is_final:
-                if result.alternatives:
-                    user_input = result.alternatives[0].transcript
-                    logging.debug(user_input)
-                    should_break = True
-                    break
-        if should_break:
-            break
-    logging.debug(f"voice text:{user_input}")
-    #stream.stop_stream()
-    #stream.close()
+            if result.is_final and result.alternatives:
+                user_input = result.alternatives[0].transcript
+                return user_input, stream
+
     return user_input, stream
 
-# Note: Very Important!!!!
-# You need to call stop_speech_to_text() some time after start_speech_to_text(), not immediately because it will crash
 def stop_speech_to_text(stream):
-    """
-    Stops the speech-to-text stream to prevent potential crashes.
-
-    Parameters:
-    - stream: The audio stream object to be stopped and closed.
-    """
     try:
         stream.stop_stream()
         stream.close()
     except Exception as e:
         logging.error(f"stop_speech_to_text error: {e}")
-        pass
 
+# Text-to-Speech setup and playback
 
 def init_text_to_speech():
-    """
-    Initializes the Google Cloud Text-to-Speech client and sets up voice and audio configurations.
-
-    Returns:
-    - tts_client (texttospeech.TextToSpeechClient): The initialized Text-to-Speech client.
-    - voice (texttospeech.VoiceSelectionParams): The default voice instance.
-    - audio_config (texttospeech.AudioConfig): The audio configuration instance.
-    """
-    # Create TextToSpeechClient instance
-    tts_client = texttospeech.TextToSpeechClient()
-
-    # Create voice instance
+    client = texttospeech.TextToSpeechClient()
     voice = texttospeech.VoiceSelectionParams(language_code=language_code, name=language_name)
+    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.LINEAR16)
+    return client, voice, audio_config
 
-    # Create audio configuration instance
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.LINEAR16
-    )
-
-    return tts_client, voice, audio_config
-
-
-def text_to_speech(text, tts_client, voice, audio_config):
-    """
-    Converts the provided text to speech using the Google Cloud Text-to-Speech service.
-
-    Parameters:
-    - text (str): The text to be converted to speech.
-    - tts_client (texttospeech.TextToSpeechClient): The initialized Text-to-Speech client.
-    - voice (texttospeech.VoiceSelectionParams): The voice instance to be used for speech synthesis.
-    - audio_config (texttospeech.AudioConfig): The audio configuration instance.
-
-    Returns:
-    - None, but plays the synthesized speech to the audio output.
-    """
-    ms_start = int(time.time() * 1000)
-    synthesis_input = texttospeech.SynthesisInput(text=text)
-
-    response = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-
+def text_to_speech(text, client, voice, audio_config):
+    input_text = texttospeech.SynthesisInput(text=text)
+    response = client.synthesize_speech(input=input_text, voice=voice, audio_config=audio_config)
     audio_data = np.frombuffer(response.audio_content, dtype=np.int16)
-    ms_end = int(time.time() * 1000)
-    logging.debug(f"google tts end, delay = {ms_end - ms_start}ms")
 
-
-    logging.debug(sd.default.device)
-    # specfiy the innner audio play device "bcm2835 Headphones" on mini pupper
     try:
         audio_device = sd.query_devices("headphone")
-        logging.info(audio_device)
         sd.default.device[1] = audio_device.get("index", sd.default.device[1])
-        logging.debug(sd.default.device)
     except Exception as e:
         logging.error(e)
     try:
         sd.play(audio_data, 24000)
         sd.wait()
     except Exception as e:
-        logging.error(f"tts play error:{e}")
+        logging.error(f"tts play error: {e}")
 
+# Main interaction loop
 
 def main():
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(funcName)s:%(lineno)d] - %(message)s',
-        level=logging.DEBUG
-    )
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.DEBUG)
 
-    current_file_path = os.path.abspath(__file__)
-    os.chdir(os.path.dirname(current_file_path))
-    logging.debug(f"init chdir: {os.path.dirname(current_file_path)}")
-
-    from dotenv import load_dotenv
     load_dotenv(dotenv_path='../.env')
-    api_path = os.environ.get('API_KEY_PATH', '')
-    if os.path.exists(api_path):
-        init_credentials(api_path)
+    api_key = os.getenv("GENAI_API_KEY", "")
+    init_credentials(api_key)
 
-    lang_code = os.environ.get('LANGUAGE_CODE', language_code)
-    lang_name = os.environ.get('LANGUAGE_NAME', language_name)
-    set_language(lang_code, lang_name)
+    set_language(
+        os.getenv("LANGUAGE_CODE", default_language_code),
+        os.getenv("LANGUAGE_NAME", default_language_name)
+    )
 
     py_audio = init_pyaudio()
     speech_client = init_speech_to_text()
     tts_client, voice, audio_config = init_text_to_speech()
-    conversation = create_conversation()
-    multi_model = ChatVertexAI(model="gemini-pro-vision")
+
+    text_model = init_text_model()
+    vision_model = init_vision_model()
 
     while True:
-        user_input = input("Enter function apis -- 'text'/'image'/'stt'/'tts' or 'exit' to quit: ").strip().lower()
-        if not user_input:
-            continue
-        inputs = user_input.split()
-        first_word = inputs[0]
-
-        if "exit" == first_word:
-            logging.debug("Exit!")
+        user_input = input("Enter 'text', 'image', 'stt', 'tts', 'chat' or 'exit': ").strip().lower()
+        if user_input == "exit":
             break
 
-        elif "text" == first_word:
-            input_text = ' '.join(inputs[1:])
-            if not input_text:
-                logging.debug("No input text!")
-            else:
-                logging.debug(f"input text: {input_text}")
-                response = ai_text_response(conversation=conversation, input_text=input_text)
-                print(response)
+        elif user_input.startswith("text"):
+            text = user_input[5:] if len(user_input) > 5 else input("Enter text: ")
+            print(ai_text_response(text_model, text))
 
-        elif "image" == first_word:
-            import media_api
-            image = media_api.take_photo()
+        elif user_input.startswith("image"):
+            try:
+                import media_api
+                image = media_api.take_photo()
+                if image:
+                    text = user_input[6:] if len(user_input) > 6 else input("Enter prompt: ")
+                    print(ai_image_response(vision_model, image, text))
+            except Exception as e:
+                logging.error(f"Image error: {e}")
 
-            if image is None:
-                logging.debug("No image captured!")
-            else:
-                text_prompt = ' '.join(inputs[1:])
-                if not text_prompt:
-                    logging.debug("No text prompt provided!")
-                else:
-                    logging.debug(f"text prompt: {text_prompt}")
-                    response = ai_image_response(multi_model, image=image, text=text_prompt)
-        elif "stt" == first_word:
+        elif user_input == "stt":
             input_text, stream = start_speech_to_text(speech_client, py_audio)
-
-            if not input_text:
-                logging.debug("No speech detected!")
-            else:
-                logging.debug(f"input text: {input_text}")
+            print(f"Recognized: {input_text}")
             time.sleep(1)
             stop_speech_to_text(stream)
 
-        elif "tts" == first_word:
-            input_text = ' '.join(inputs[1:])
-            if not input_text:
-                logging.debug("No input text provided!")
-            else:
-                logging.debug(f"TTS is speaking: {input_text}")
-                text_to_speech(input_text, tts_client, voice, audio_config)
+        elif user_input.startswith("tts"):
+            text = user_input[4:] if len(user_input) > 4 else input("Enter text to speak: ")
+            text_to_speech(text, tts_client, voice, audio_config)
+
+        elif user_input.startswith("chat"):
+            history_file_path= "../res/ece_history.json"
+            conversation = create_conversation(history_file_path)
+            init_input = (
+                "From now on, always answer as if a human being is speaking naturally, "
+                "with concise, relevant, and conversational tone. "
+                "Only respond in one-breath answers. "
+                "If the input uses a different language, like language A, "
+                "please respond in that same language."
+            )
+            text = ai_text_response(text_model, init_input, conversation)
+            print(f"Recognized: {text}")
+            text = user_input[5:] if len(user_input) > 5 else input("Enter text: ")
+            response = ai_text_response(text_model, text, conversation)
+
+            print(f"Recognized: {response}")
+
 
 if __name__ == '__main__':
     main()
