@@ -32,14 +32,14 @@ import threading
 from google.cloud import texttospeech
 from langchain_google_vertexai import ChatVertexAI
 import random
-import vertexai
-from vertexai.generative_models import GenerativeModel
+from google import genai
+from google.genai.types import HttpOptions
+
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from task_queue import input_text_queue, output_text_queue, gif_queue, image_queue, movement_queue, stt_queue
 from api import media_api, google_api, move_api, shell_api
-from google import genai
-from google.genai.types import HttpOptions
+
 
 RES_DIR = "cartoons"
 
@@ -315,40 +315,57 @@ def gemini_task():
     """
     Task for handling Gemini AI interactions.
     """
-    #from vertexai.generative_models import GenerativeModel
     logging.debug("gemini task start.")
-
-    history_file_path = "res/ece_history.json"
-    conversation = google_api.create_conversation(history_file_path)
-    init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breathe responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
-
-"""    
-    response = google_api.ai_text_response(conversation, init_input)
-    logging.debug(f"init llm and first response: {response}")
-    vertexai.init(project="minipupper-436416", location="us-central1")
-    #multi_model = ChatVertexAI(model="gemini-pro-vision")
-    multi_model = GenerativeModel("gemini-2.0-flash-001")
-    ##multi_model = GenerativeModel("chat-bison")
-
-    init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breathe responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
-    client = genai.Client(http_options=HttpOptions(api_version="v1"))
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-001",
-        contents=init_input,
-    )
-    """
+    # Initialize Gemini models
     text_model = google_api.init_text_model()
-    response = google_api.ai_text_response(text_model, init_input, conversation)
+    image_model = google_api.init_vision_model()
+    
+    history_file_path = "res/ece_history.json"
 
+    conversation = google_api.create_conversation(history_file_path)
+    
 
+    
+    # Define initial input to prime the conversation
+    init_input = (
+        "From now on, always answer as if a human being is speaking naturally, "
+        "with concise, relevant, and conversational tone. "
+        "Only respond in one-breath answers. "
+        "If the input uses a different language, like language A, "
+        "please respond in that same language."
+    )
+    
+    try:
+        # Generate initial response using text model
+        
+        response = google_api.ai_text_response(text_model, init_input, conversation)
+        logging.debug(f"Initialized LLM with first response: {response}")
+    
+        # Optional: Save the conversation history immediately
+        google_api.save_conversation(conversation, history_file_path)
+    
+    except Exception as e:
+        logging.error(f"Error during model initialization: {e}")
 
+    
+    #multi_model = ChatVertexAI(model="gemini-pro-vision",  # latest working model
+    #location="us-central1")
+    
     with Image.open(f"{RES_DIR}/Trot.jpg") as image:
         logging.debug(f"Opened image: 320p")
         if image is None:
             logging.debug("No image captured!")
         else:
             text_prompt = "what is this?"
-            response = google_api.ai_image_response(multi_model, image=image, text=text_prompt)
+
+            try:
+                response = google_api.ai_image_response(image_model, image, text_prompt)
+                logging.debug(f"AI Vision response: {response}")
+            
+            except Exception as e:
+                logging.error(f"Error during AI Vision response: {e}")
+                response = "Sorry, I couldn't understand the image."
+           # response = google_api.ai_image_response(image_model, image=image, text=text_prompt)
     logging.debug(f"init vision model and first response: {response}")
     stt_queue.put(True)
     image = Image.open(f"{RES_DIR}/hello.png")
@@ -378,10 +395,18 @@ def gemini_task():
             if image:
                 image = media_api.resize_image_to_width(image, 320)
                 logging.debug(f"resize photo finish!")
-                response = google_api.ai_image_response(multi_model, image=image, text=user_input)
+                #response = google_api.ai_image_response(image_model, image=image, text=user_input)
+
+                try:
+                    response = google_api.ai_image_response(image_model, image, user_input)
+                    logging.debug(f"AI Vision response: {response}")
+                
+                except Exception as e:
+                    logging.error(f"Error during AI Vision response: {e}")
+                    response = "Sorry, I couldn't understand the image."
                 image_queue.put(image)
             else:
-                response = google_api.ai_text_response(conversation, user_input)
+                response = google_api.ai_text_response(text_model, conversation, user_input)
 
             logging.debug(f"detect pic end!")
             ms_end = int(time.time() * 1000)
@@ -404,7 +429,16 @@ def gemini_task():
             puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
             image_queue.put(puppy_image)
 
-            human_gesture = google_api.ai_image_response(multi_model, image=human_image, text=user_input)
+           # human_gesture = google_api.ai_image_response(image_model, image=human_image, text=user_input)
+            try:
+                human_gesture = google_api.ai_image_response(image_model, human_image, user_input)
+                logging.debug(f"AI Vision response: {response}")
+            
+            except Exception as e:
+                logging.error(f"Error during AI Vision response: {e}")
+                response = "Sorry, I couldn't understand the image."
+    
+            
             human_gesture = human_gesture.replace(' ', '')
             logging.debug(f"human_gesture is: {human_gesture}")
 
@@ -417,9 +451,12 @@ def gemini_task():
         else:
             logging.debug("text response start!")
             #gif_queue.put(True)
-            response = google_api.ai_text_response(conversation, user_input)
-            logging.debug("text response end: {response}")
+            #response = google_api.ai_text_response(text_model, conversation, user_input)
+            logging.debug(user_input)
+            response = google_api.ai_text_response(text_model, user_input, conversation)
+            logging.debug(f"text response end: {response[:100]}")
             output_text_queue.put(response)
+            
         time.sleep(0.05)
 
 
@@ -514,7 +551,7 @@ def main():
 
     from dotenv import load_dotenv
     load_dotenv(dotenv_path='./.env')
-    api_path = os.environ.get('API_KEY_PATH', '')
+    api_path = os.environ.get('GENAI_API_KEY', '')
     logging.debug(f"api key path: {api_path}")
     if os.path.exists(api_path):
         logging.debug("init credentials start.")
