@@ -10,3 +10,4 @@ google-cloud-speech
 langchain
 langchain-google-vertexai
 opencv-python==4.10.0.84
+google-genai
