@@ -17,6 +17,7 @@ import soundfile as sf
 from google.cloud import speech
 from google.cloud import texttospeech
 
+
 from dotenv import load_dotenv
 
 # Language settings
@@ -94,11 +95,20 @@ def ai_text_response(model, prompt: str, conversation=None) -> str:
     return reply
 
 
+
 def ai_image_response(model, image: Image.Image, text: str) -> str:
+    # Convert PIL Image to bytes with proper formatting
     buffered = BytesIO()
     image.save(buffered, format="JPEG")
     image_bytes = buffered.getvalue()
-    response = model.generate_content([text, image_bytes])
+    
+    # Create the proper format expected by the API
+    image_part = {
+        "mime_type": "image/jpeg",
+        "data": image_bytes
+    }
+    
+    response = model.generate_content([text, image_part])
     return response.text.strip()
 
 # Conversation support using simple in-memory history
