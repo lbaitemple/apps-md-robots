@@ -52,6 +52,13 @@ pip install --upgrade google-genai
 
 ```
 
+add the following to the .bashrc
+```
+export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/.gemini/creds.json 
+export GOOGLE_CLOUD_LOCATION=us-central1
+export GOOGLE_GENAI_USE_VERTEXAI=True
+```
+
 
 Set your google cloud API key in env.example file and then start.
  
