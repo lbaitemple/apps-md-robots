@@ -30,7 +30,6 @@ from io import BytesIO
 import asyncio
 import threading
 from google.cloud import texttospeech
-from langchain_google_vertexai import ChatVertexAI
 import random
 from google import genai
 from google.genai.types import HttpOptions
