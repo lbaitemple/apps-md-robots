@@ -47,6 +47,8 @@ git clone -b gemini2 https://github.com/lbaitemple/apps-md-robots/
 cd apps-md-robots
 sudo apt-get install -y python3-pyaudio
 sudo pip install -r requirements.txt
+pip install --upgrade google-genai
+
 
 ```
 
