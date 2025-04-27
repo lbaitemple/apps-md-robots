@@ -43,7 +43,7 @@ For the video guide, please click the picture and refer to the demo video.
 Clone this repo, and install denpendency libs.
 ```
 cd ~
-git clone https://github.com/mangdangroboticsclub/apps-md-robots
+git clone -b gemini2 https://github.com/lbaitemple/apps-md-robots/
 cd apps-md-robots
 sudo apt-get install -y python3-pyaudio
 sudo pip install -r requirements.txt
