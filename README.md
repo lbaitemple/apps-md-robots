@@ -59,7 +59,10 @@ export GOOGLE_CLOUD_LOCATION=us-central1
 export GOOGLE_GENAI_USE_VERTEXAI=True
 ```
 
-
+```
+mkdir -p ~/.gemini
+cp <json_file> ~/.gemini/creds.json
+```
 Set your google cloud API key in env.example file and then start.
  
 ```
