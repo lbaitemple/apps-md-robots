@@ -28,6 +28,6 @@ run app demos, eg. ai_apps
  
 ```
 cd ~/apps-md-robots
-python ai_apps/ai_app.py
+python ai_app/ai_app.py
 ```
 
