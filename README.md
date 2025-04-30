@@ -19,7 +19,7 @@ Set your google cloud API key in env.example file and then start.
  
 ```
 cd ~/apps-md-robots
-cp env.example .env
+cp env.sample .env
 
 ```
 
