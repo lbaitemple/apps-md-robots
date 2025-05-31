@@ -20,6 +20,8 @@ image_queue = queue.Queue()
 #movement, input movement text: "sit"/"walk"
 movement_queue = queue.Queue()
 
+heads_up_queue = queue.Queue()
+
 
 # stt queue, when puppy is speaking, we should not stt, put False into the queue, after speak finish, put True into queue
 stt_queue = queue.Queue()
