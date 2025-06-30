@@ -8,5 +8,5 @@ google-auth
 google-cloud-texttospeech
 google-cloud-speech
 langchain==0.3.22
-langchain-google-vertexai==2.0.24
+langchain-google-vertexai==2.0.23
 opencv-python==4.10.0.84
