@@ -7,6 +7,6 @@ pyaudio
 google-auth
 google-cloud-texttospeech
 google-cloud-speech
-langchain
+langchain==0.3.22
 langchain-google-vertexai==2.0.24
 opencv-python==4.10.0.84
