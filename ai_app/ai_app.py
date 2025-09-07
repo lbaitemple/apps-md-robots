@@ -55,6 +55,7 @@ voice_DE = texttospeech.VoiceSelectionParams(language_code="de-DE", name="de-DE-
 voice_FR = texttospeech.VoiceSelectionParams(language_code="fr-FR", name="fr-FR-Standard-C")
 voice_HK = texttospeech.VoiceSelectionParams(language_code="yue-HK", name="yue-HK-Standard-C")
 voice_ES = texttospeech.VoiceSelectionParams(language_code="es-US", name="es-US-Wavenet-A")
+voice_IL = texttospeech.VoiceSelectionParams(language_code="es-US", name="he-IL-Standard-A")
 
 lang_voices = {
     "Japanese": voice_JP,
@@ -64,6 +65,7 @@ lang_voices = {
     "French": voice_FR,
     "Cantonese": voice_HK,
     "Spanish": voice_ES,
+    "Hebrew": voice_IL,    
 }
 cur_voice = voice0
 
