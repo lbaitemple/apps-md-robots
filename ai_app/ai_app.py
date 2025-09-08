@@ -194,7 +194,10 @@ def cut_text_by_last_period(text, max_words_before_period=15):
     Returns:
     - cut_text (str): The text cut by the last period.
     """
-    words = text.split()
+    #words = text.split()
+    clean_text = re.sub(r"\*(breathes(?: in)?)\*", "", text)
+
+    words = clean_text.split()
 
     last_period_index = -1
     for i, word in enumerate(words[:max_words_before_period]):
