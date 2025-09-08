@@ -194,10 +194,7 @@ def cut_text_by_last_period(text, max_words_before_period=15):
     Returns:
     - cut_text (str): The text cut by the last period.
     """
-    #words = text.split()
-    clean_text = re.sub(r"\*(breathes(?: in)?)\*", "", text)
-
-    words = clean_text.split()
+    words = text.split()
 
     last_period_index = -1
     for i, word in enumerate(words[:max_words_before_period]):
@@ -278,25 +275,22 @@ def stt_task():
         if not user_input:
             logging.debug(f"no input!")
             stt_queue.put(True)
+            movement_queue.put(True)
         elif sys_cmd_key:
             logging.debug(f"sys cmd: {sys_cmd_key}")
             sys_cmd_func()
-        elif "sit" == move_key or "action" == move_key:
+        elif ai_on and ("sit" == move_key or "action" == move_key):
             movement_queue.put(move_key)
             output_text_queue.put("OK, my friend.")
-        elif "walk" in user_input or "come" in user_input or "go" in user_input:
+        elif ai_on and ("walk" in user_input or "come" in user_input or "go" in user_input):
             movement_queue.put("move forwards")
             output_text_queue.put("My friend, here I come.")
-        elif move_key:
+        elif ai_on and move_key:
             movement_queue.put(move_key)
             output_text_queue.put(f"OK, my friend, {move_key} immediatly.")
         elif not ai_on:
-            logging.info(f"ai is not on, do not use gemini")
+            logging.info(f"ai is not on, do not use gemini - ignoring non-movement input")
             stt_queue.put(True)
-            time.sleep(0.5)
-            google_api.stop_speech_to_text(stream)
-            time.sleep(0.5)
-            continue
         elif "game" in user_input or "play" in user_input:
             #movement_queue.put("trot")
             output_text_queue.put(GAME_TEXT)
@@ -305,10 +299,12 @@ def stt_task():
             user_input += f", Please reply in {lang}."
             input_text_queue.put(user_input)
             stt_queue.put(False)
+            movement_queue.put(False)
         else:
             logging.debug(f"put voice text to input queue: {user_input}")
             input_text_queue.put(user_input)
             stt_queue.put(False)
+            movement_queue.put(False)
         time.sleep(0.5)
         google_api.stop_speech_to_text(stream)
         time.sleep(0.5)
