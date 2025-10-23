@@ -10,3 +10,5 @@ google-cloud-speech
 langchain==0.3.22
 langchain-google-vertexai==2.0.23
 opencv-python==4.10.0.84
+noisereduce 
+webrtcvad
