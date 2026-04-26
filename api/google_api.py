@@ -97,7 +97,7 @@ def create_conversation(history_file_path=''):
                 
 
     model = ChatVertexAI(
-        model_name='gemini-2.0-flash',
+        model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
         convert_system_message_to_human=True,
     )
 
