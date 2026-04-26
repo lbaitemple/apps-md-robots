@@ -755,7 +755,7 @@ def gemini_task():
     logging.debug(f"init llm and first response: {response}")
 
     multi_model = ChatVertexAI(
-        model_name='gemini-2.0-flash',
+        model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
         convert_system_message_to_human=True,
     )
     with Image.open(f"{RES_DIR}/Trot.jpg") as image:
