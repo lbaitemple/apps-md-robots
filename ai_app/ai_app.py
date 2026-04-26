@@ -324,7 +324,7 @@ def gemini_task():
 
     #multi_model = ChatVertexAI(model="gemini-pro-vision")
     multi_model = ChatVertexAI(
-            model_name='gemini-2.0-flash',
+            model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash'),
             convert_system_message_to_human=True,
         )
     with Image.open(f"{RES_DIR}/Trot.jpg") as image:
@@ -413,7 +413,8 @@ def tts_task():
     Task for text-to-speech conversion and audio output.
     """
     logging.debug("tts task start.")
-    os.system("amixer -c 0 sset 'Headphone' 100%")
+    audio_mixer_control = os.environ.get('AUDIO_MIXER_CONTROL', 'Headphone')
+    os.system(f"amixer -c 0 sset '{audio_mixer_control}' 100%")
     tts_client, voice, audio_config = google_api.init_text_to_speech()
     global voice0, cur_voice
     voice0 = voice

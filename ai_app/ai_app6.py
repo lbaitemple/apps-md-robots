@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Description: Enhanced AI app with noise-robust speech-to-text using WebRTC VAD and advanced noise reduction.
-# Handles speech in noisy environments (TV, dogs barking, people talking, lawn mowers, etc.)
+# Description: Enhanced AI app with TTS interrupt capability and visual feedback.
+# Users can say "that is enough" or "stop" to interrupt long responses.
+# Includes noise-robust speech-to-text using WebRTC VAD with visual status indicators.
+# Visual feedback: hello_y.png (calibration), hello_r.png (listening), hello_g.png (completed)
 #
 
 import logging
@@ -51,6 +53,10 @@ RES_DIR = "cartoons"
 GAME_TEXT = "Let's play! Rock! Paper! Scissor! Shoot!"
 ai_on = True
 
+# TTS interrupt control
+tts_interrupt_flag = threading.Event()  # Flag to signal TTS to stop
+tts_active = False  # Track if TTS is currently speaking
+
 # Define voice parameters for different languages and a default voice
 voice0 = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-E")
 voice_man = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Neural2-D")
@@ -84,10 +90,47 @@ heads_up_questions = 0
 last_response = ""
 
 
+def show_status_image(status):
+    """
+    Display status images for different speech recognition stages.
+    Only displays images when AI is active (ai_on=True).
+    When AI is off, keeps the logo2.png image displayed.
+    
+    Args:
+        status: 'calibrating', 'listening', 'completed', or 'ready'
+    """
+    global ai_on
+    
+    # Don't change image when AI is off (close_ai mode)
+    if not ai_on:
+        logging.debug(f"AI is off - keeping logo2.png, ignoring status '{status}'")
+        return
+    
+    try:
+        if status == 'calibrating':
+            image = Image.open(f"{RES_DIR}/hello_y.png")  # Yellow for calibration
+            image_queue.put(image)
+            logging.info("🟡 Displaying calibration status (hello_y.png)")
+        elif status == 'listening':
+            image = Image.open(f"{RES_DIR}/hello_r.png")  # Red for active listening
+            image_queue.put(image)
+            logging.info("🔴 Displaying listening status (hello_r.png)")
+        elif status == 'completed':
+            image = Image.open(f"{RES_DIR}/hello_g.png")  # Green for completed
+            image_queue.put(image)
+            logging.info("🟢 Displaying completion status (hello_g.png)")
+        elif status == 'ready':
+            image = Image.open(f"{RES_DIR}/hello.png")    # Default ready state
+            image_queue.put(image)
+            logging.info("⚪ Displaying ready status (hello.png)")
+    except Exception as e:
+        logging.error(f"Failed to display status image for '{status}': {e}")
+
+
 class NoiseRobustSTT:
     """
     Noise-robust speech-to-text for noisy environments.
-    Uses WebRTC VAD and advanced noise reduction.
+    Uses WebRTC VAD and advanced noise reduction with visual feedback.
     """
     
     def __init__(self, speech_client, py_audio, sample_rate=16000, chunk_size=320, 
@@ -140,8 +183,11 @@ class NoiseRobustSTT:
     
     def calibrate_noise(self, stream):
         """
-        Calibrate noise profile from ambient sound.
+        Calibrate noise profile from ambient sound with visual feedback.
         """
+        # Show calibration status image
+        show_status_image('calibrating')
+        
         print("\n" + "="*60)
         print("🎤 Calibrating noise profile for complex noise environment...")
         print("="*60)
@@ -177,6 +223,9 @@ class NoiseRobustSTT:
         print("="*60 + "\n")
         
         logging.info(f"Noise calibration complete! Noise level: {noise_rms:.0f}, Threshold: {self.silence_threshold:.0f}")
+        
+        # Show ready status after calibration
+        show_status_image('ready')
     
     def reduce_noise(self, audio_data):
         """
@@ -286,7 +335,7 @@ class NoiseRobustSTT:
     
     def listen_once(self, stream):
         """
-        Listen for one complete speech utterance using VAD.
+        Listen for one complete speech utterance using VAD with visual feedback.
         Returns the transcribed text or None.
         """
         # Reset state
@@ -326,6 +375,9 @@ class NoiseRobustSTT:
                             logging.info(f"🎤 Speech detected! Recording... (captured {ring_buffer_duration:.2f}s pre-speech buffer)")
                             speech_detected = True
                             
+                            # Show listening status image
+                            show_status_image('listening')
+                            
                             # Add ring buffer (captures the first word!)
                             if self.ring_buffer:
                                 logging.debug(f"Adding {len(self.ring_buffer)} ring buffer frames to audio")
@@ -363,6 +415,9 @@ class NoiseRobustSTT:
                 if self.is_currently_speaking and self.consecutive_silent_frames >= self.num_silent_frames_threshold:
                     logging.info(f"Speech ended after {self.consecutive_silent_frames} silent frames (~{self.consecutive_silent_frames * 0.02:.1f}s). Processing...")
                     
+                    # Show completion status image
+                    show_status_image('completed')
+                    
                     # Convert accumulated audio to bytes
                     if self.accumulated_audio:
                         full_audio = np.concatenate(self.accumulated_audio)
@@ -378,22 +433,31 @@ class NoiseRobustSTT:
                             self.consecutive_speech_frames = 0
                             self.is_currently_speaking = False
                             self.ring_buffer = []
+                            show_status_image('ready')  # Return to ready state
                             return None
                         
                         audio_bytes = full_audio.tobytes()
                         
                         # Transcribe
                         transcript = self.transcribe_audio(audio_bytes)
+                        
+                        # Show ready status after processing
+                        show_status_image('ready')
+                        
                         return transcript
                     
+                    # Show ready status if no audio accumulated
+                    show_status_image('ready')
                     return None
                     
             except Exception as e:
                 logging.error(f"Error during listening: {e}")
+                show_status_image('ready')  # Return to ready state on error
                 return None
         
         # Timeout - no speech detected
         logging.debug("Listening timeout - no speech detected")
+        show_status_image('ready')  # Return to ready state on timeout
         return None
 
 
@@ -513,8 +577,7 @@ def open_ai():
     global ai_on
     ai_on = True
     stt_queue.put(True)
-    image = Image.open(f"{RES_DIR}/hello.png")
-    image_queue.put(image)
+    show_status_image('ready')
     output_text_queue.put("OK, my friend.")
 
 def reboot():
@@ -595,7 +658,7 @@ def remove_asterisk_text(text):
 
 def stt_task():
     """
-    Enhanced task for noise-robust speech-to-text conversion.
+    Enhanced task for noise-robust speech-to-text conversion with visual feedback.
     Uses WebRTC VAD and advanced noise reduction for noisy environments.
     """
     logging.debug("Enhanced noise-robust STT task start.")
@@ -606,37 +669,46 @@ def stt_task():
     # Get language settings
     lang_code = os.environ.get('LANGUAGE_CODE', 'en-US')
     
+    # Detect the hardware's native sample rate to avoid paInvalidSampleRate
+    device_info = py_audio.get_default_input_device_info()
+    native_rate = int(device_info['defaultSampleRate'])  # e.g. 48000 on Google Voice HAT
+    # VAD requires exactly 10/20/30 ms frames; 20 ms at native_rate samples
+    native_chunk = int(native_rate * 0.020)
+
     # Initialize noise-robust STT
     noise_robust_stt = NoiseRobustSTT(
         speech_client=speech_client,
         py_audio=py_audio,
-        sample_rate=16000,
-        chunk_size=320,  # 20ms frames for VAD
-        vad_aggressiveness=2,  # 0-3: 2 = balanced between sensitivity and noise rejection
+        sample_rate=native_rate,
+        chunk_size=native_chunk,
+        vad_aggressiveness=1,  # 0-3: lower = more sensitive to speech
         language_code=lang_code
     )
-    
+
     # Open audio stream
     stream = py_audio.open(
         format=pyaudio.paInt16,
         channels=1,
-        rate=16000,
+        rate=native_rate,
         input=True,
-        frames_per_buffer=320
+        frames_per_buffer=native_chunk
     )
     
-    # Calibrate noise profile once at startup
+    # Calibrate noise profile once at startup with visual feedback
     print("\n" + "="*60)
-    print("🎤 NOISE-ROBUST SPEECH-TO-TEXT INITIALIZATION")
+    print("🎤 NOISE-ROBUST SPEECH-TO-TEXT WITH VISUAL FEEDBACK")
     print("="*60)
     noise_robust_stt.calibrate_noise(stream)
     print("✅ System ready for speech recognition!")
     print("🎙️  Using: WebRTC VAD (Voice Activity Detection)")
     print("⏱️  Auto-stops after ~0.5s of silence")
     print("🎯 Captures first word with 0.6s pre-speech buffer")
-    print("💡 Note: Noise reduction disabled to preserve audio quality")
+    print("🟡 Yellow: Calibrating noise profile")
+    print("🔴 Red: Actively listening to speech")
+    print("🟢 Green: Speech processing completed")
+    print("⚪ White: Ready for next command")
     print("="*60 + "\n")
-    logging.info("Calibration complete! Ready for speech recognition.")
+    logging.info("Calibration complete! Ready for speech recognition with visual feedback.")
 
     while True:
         logging.debug("stt wait for all init task has done / tts work has finished ... ...")
@@ -653,13 +725,22 @@ def stt_task():
         
         logging.debug("stt task start loop, listening with noise-robust VAD...")
         
-        # Use noise-robust STT with VAD
+        # Use noise-robust STT with VAD and visual feedback
         user_input = noise_robust_stt.listen_once(stream)
         logging.debug(f"voice input: {user_input}")
 
         # Handle None input
         if not user_input:
             logging.debug(f"no input!")
+            stt_queue.put(True)
+            continue
+
+        # Check for TTS interrupt commands
+        global tts_interrupt_flag, tts_active
+        interrupt_phrases = ["that is enough", "that's enough", "stop", "enough", "be quiet", "shut up"]
+        if tts_active and any(phrase in user_input.lower() for phrase in interrupt_phrases):
+            logging.info(f"🛑 TTS interrupt detected: '{user_input}'")
+            tts_interrupt_flag.set()  # Signal TTS to stop
             stt_queue.put(True)
             continue
 
@@ -741,7 +822,7 @@ def gemini_task():
     logging.debug(f"init llm and first response: {response}")
 
     multi_model = ChatVertexAI(
-        model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.0-flash'),
+        model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
         convert_system_message_to_human=True,
     )
     with Image.open(f"{RES_DIR}/Trot.jpg") as image:
@@ -753,8 +834,7 @@ def gemini_task():
             response = google_api.ai_image_response(multi_model, image=image, text=text_prompt)
     logging.debug(f"init vision model and first response: {response}")
     stt_queue.put(True)
-    image = Image.open(f"{RES_DIR}/hello.png")
-    image_queue.put(image)
+    show_status_image('ready')
 
     while True:
         logging.debug("tts wait for gemini responese text... ...")
@@ -920,10 +1000,12 @@ def gemini_task():
 
 def tts_task():
     """
-    Task for text-to-speech conversion and audio output.
+    Task for text-to-speech conversion and audio output with interrupt support.
     """
+    global tts_interrupt_flag, tts_active
+    
     logging.debug("tts task start.")
-    audio_mixer_control = os.environ.get('AUDIO_MIXER_CONTROL', 'Headphone')
+    audio_mixer_control = os.environ.get('AUDIO_MIXER_CONTROL', 'PCM')
     os.system(f"amixer -c 0 sset '{audio_mixer_control}' 100%")
     tts_client, voice, audio_config = google_api.init_text_to_speech()
     global voice0, cur_voice
@@ -939,9 +1021,37 @@ def tts_task():
             stt_queue.put(True)
             continue
 
+        # Clear interrupt flag and mark TTS as active
+        tts_interrupt_flag.clear()
+        tts_active = True
         stt_queue.put(False)
-        google_api.text_to_speech(out_text, tts_client, cur_voice, audio_config)
-       
+        
+        # Start TTS in a separate thread so we can monitor for interrupts
+        tts_thread = threading.Thread(
+            target=google_api.text_to_speech,
+            args=(out_text, tts_client, cur_voice, audio_config)
+        )
+        tts_thread.start()
+        
+        # Monitor for interrupts while TTS is running
+        while tts_thread.is_alive():
+            if tts_interrupt_flag.is_set():
+                logging.info("🛑 Interrupting TTS playback")
+                # Stop the audio playback
+                try:
+                    os.system("killall -9 aplay 2>/dev/null")  # Stop audio playback
+                except:
+                    pass
+                break
+            time.sleep(0.05)
+        
+        tts_thread.join(timeout=0.1)
+        tts_active = False
+        
+        if tts_interrupt_flag.is_set():
+            logging.info("TTS interrupted by user")
+            tts_interrupt_flag.clear()
+        
         if GAME_TEXT == out_text:
             text = "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? Only in one word, no punctuation and all in lowercase."
             input_text_queue.put(text)
@@ -1032,7 +1142,12 @@ def main():
     google_api.set_language(lang_code, lang_name)
 
     logging.info("="*60)
-    logging.info("AI APP 4 - NOISE-ROBUST SPEECH RECOGNITION")
+    logging.info("AI APP 6 - VISUAL FEEDBACK SPEECH RECOGNITION")
+    logging.info("Enhanced with visual status indicators:")
+    logging.info("  🟡 Yellow: Calibrating noise profile")
+    logging.info("  🔴 Red: Actively listening to speech")
+    logging.info("  🟢 Green: Speech processing completed")
+    logging.info("  ⚪ White: Ready for next command")
     logging.info("Optimized for noisy environments:")
     logging.info("  - TV noise, dog barking, people talking")
     logging.info("  - Lawn mowers, traffic, background music")
