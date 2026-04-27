@@ -1005,7 +1005,9 @@ def tts_task():
     global tts_interrupt_flag, tts_active
     
     logging.debug("tts task start.")
-    os.system("amixer -c 0 sset 'PCM' 100%")
+    amixer_control = os.environ.get('AMIXER_CONTROL', 'PCM')
+    os.system(f"amixer -c 0 sset '{amixer_control}' 100%")
+
     tts_client, voice, audio_config = google_api.init_text_to_speech()
     global voice0, cur_voice
     voice0 = voice
