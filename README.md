@@ -45,7 +45,7 @@ Clone this repo, and install denpendency libs.
 cd ~
 git clone https://github.com/mangdangroboticsclub/apps-md-robots
 cd apps-md-robots
-sudo apt-get install -y portaudio19-dev python3-pyaudio
+sudo apt-get install -y portaudio19-dev python3-pyaudio libgl1
 sudo pip install -r requirements.txt
 
 ```
