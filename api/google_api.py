@@ -246,18 +246,25 @@ def start_speech_to_text(speech_client, py_audio):
     CHUNK = int(RATE / 10)
 
     def audio_generator(stream, chunk):
-        try:
-            while True:
-                data = stream.read(chunk)
+        while True:
+            try:
+                # During long idle time, the input buffer can overflow.
+                # Suppress overflow exceptions and continue streaming.
+                data = stream.read(chunk, exception_on_overflow=False)
                 if not data:
                     # End of stream, break out of the loop
                     break
                 yield data
-        except Exception as e:
-            # Handle any exceptions that may occur while reading from the stream
-            logging.error(f"Error reading from audio stream: {e}")
-            # You may want to close the stream or return a signal to indicate an error
-            yield None
+            except OSError as e:
+                if getattr(e, "errno", None) == -9981 or "Input overflowed" in str(e):
+                    logging.warning("Audio input overflow detected; dropping buffered audio and continuing")
+                    continue
+                logging.error(f"Error reading from audio stream: {e}")
+                break
+            except Exception as e:
+                # Handle unexpected stream errors and stop generator.
+                logging.error(f"Error reading from audio stream: {e}")
+                break
 
 
     stream = py_audio.open(format=pyaudio.paInt16,
