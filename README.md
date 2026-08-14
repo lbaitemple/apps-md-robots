@@ -117,14 +117,15 @@ sudo loginctl enable-linger "$USER"
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 ```
 
-For a manual setup, copy the Google Cloud credential into a private directory
-and create `.env` with its absolute path:
+For a manual setup, copy the supplied credential to the standard Gemini
+location and create `.env` from the sample:
  
 ```bash
-install -d -m 700 .credentials
-install -m 600 ~/Downloads/google-cloud-key.json .credentials/google-cloud.json
+mkdir -p ~/.gemini
+cp ~/minipupper_creds.json ~/.gemini/creds.json
 cp env.sample .env
-sed -i "s|^API_KEY_PATH=.*|API_KEY_PATH=$PWD/.credentials/google-cloud.json|" .env
+chmod 700 ~/.gemini
+chmod 600 ~/.gemini/creds.json
 chmod 600 .env
 ```
 

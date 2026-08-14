@@ -4,10 +4,12 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./update_os.sh --credential /absolute/or/relative/path/to/key.json
+Usage: ./update_os.sh [--credential /path/to/key.json]
 
 Installs the Ubuntu and Python dependencies, configures PipeWire audio, and
-copies a Google Cloud service-account credential into the project.
+copies a Google Cloud service-account credential to ~/.gemini/creds.json.
+
+The credential defaults to ~/minipupper_creds.json.
 
 Run this script as the normal audio user, not with sudo. The script uses sudo
 only to install Ubuntu packages.
@@ -19,7 +21,7 @@ if [[ ${EUID} -eq 0 ]]; then
     exit 1
 fi
 
-credential_source=""
+credential_source="${HOME}/minipupper_creds.json"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --credential)
@@ -39,15 +41,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-[[ -n ${credential_source} ]] || { echo "Error: --credential is required." >&2; usage; exit 2; }
 [[ -f ${credential_source} ]] || { echo "Error: credential file not found: ${credential_source}" >&2; exit 2; }
 [[ ! -L ${credential_source} ]] || { echo "Error: credential must not be a symbolic link." >&2; exit 2; }
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "${script_dir}"
 credential_source=$(realpath -- "${credential_source}")
-credential_dir="${script_dir}/.credentials"
-credential_target="${credential_dir}/google-cloud.json"
+credential_dir="${HOME}/.gemini"
+credential_target="${credential_dir}/creds.json"
+bsp_python_module="${HOME}/mini_pupper_bsp/Python_Module"
 venv_dir="${script_dir}/.venv"
 env_file="${script_dir}/.env"
 env_tmp=""
@@ -85,10 +87,26 @@ sudo apt-get install -y \
     pulseaudio-utils libasound2-plugins
 
 if [[ ! -x ${venv_dir}/bin/python ]]; then
-    python3 -m venv "${venv_dir}"
+    python3 -m venv --system-site-packages "${venv_dir}"
+else
+    # The robot hardware drivers are installed system-wide by mini_pupper_bsp.
+    python3 -m venv --upgrade --system-site-packages "${venv_dir}"
 fi
 "${venv_dir}/bin/python" -m pip install --upgrade pip
 "${venv_dir}/bin/python" -m pip install -r "${script_dir}/requirements.txt"
+if [[ ! -f ${bsp_python_module}/setup.py ]]; then
+    echo "Error: Mini Pupper BSP Python module not found at ${bsp_python_module}." >&2
+    exit 1
+fi
+"${venv_dir}/bin/python" - "${bsp_python_module}" <<'PY'
+import pathlib
+import site
+import sys
+
+bsp_path = pathlib.Path(sys.argv[1]).resolve()
+pth_file = pathlib.Path(site.getsitepackages()[0]) / "mini_pupper_bsp.pth"
+pth_file.write_text(f"{bsp_path}\n", encoding="utf-8")
+PY
 
 install -d -m 700 -- "${credential_dir}"
 if [[ ${credential_source} != ${credential_target} ]]; then
