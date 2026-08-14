@@ -713,16 +713,22 @@ class NoiseRobustSTT:
         # VAD parameters for speech detection
         silence_ms = int(os.environ.get("VAD_END_SILENCE_MS", "450"))
         start_confirm_ms = int(os.environ.get("VAD_START_CONFIRM_MS", "100"))
-        barge_in_confirm_ms = int(os.environ.get("BARGE_IN_CONFIRM_MS", "160"))
-        self.barge_in_guard_ms = max(0, int(os.environ.get("BARGE_IN_GUARD_MS", "100")))
+        barge_in_confirm_ms = int(os.environ.get("BARGE_IN_CONFIRM_MS", "100"))
+        self.barge_in_guard_ms = max(0, int(os.environ.get("BARGE_IN_GUARD_MS", "80")))
         self.num_silent_frames_threshold = max(1, silence_ms // self.vad_frame_duration_ms)
         self.num_speech_frames_threshold = max(1, start_confirm_ms // self.vad_frame_duration_ms)
         self.num_barge_in_frames_threshold = max(
             self.num_speech_frames_threshold,
             barge_in_confirm_ms // self.vad_frame_duration_ms,
         )
+        barge_in_max_gap_ms = max(
+            0, int(os.environ.get("BARGE_IN_MAX_GAP_MS", "60"))
+        )
+        self.barge_in_max_gap_frames = (
+            barge_in_max_gap_ms // self.vad_frame_duration_ms
+        )
         self.cancel_barge_in_on_vad = env_flag("BARGE_IN_CANCEL_ON_VAD", False)
-        self.barge_in_min_rms = max(0, int(os.environ.get("BARGE_IN_MIN_RMS", "300")))
+        self.barge_in_min_rms = max(0, int(os.environ.get("BARGE_IN_MIN_RMS", "120")))
         self.silence_threshold = int(os.environ.get("VAD_RMS_FALLBACK_THRESHOLD", "500"))
         pre_roll_ms = int(os.environ.get("PRE_ROLL_MS", "400"))
         self.ring_buffer_size = max(10, pre_roll_ms // self.vad_frame_duration_ms)
@@ -730,11 +736,13 @@ class NoiseRobustSTT:
         logging.info(
             "STT front end initialized: WebRTC VAD=%d, pre-roll=%dms, "
             "speech confirmation=%dms, barge confirmation=%dms, "
-            "barge guard=%dms, cancel-on-VAD=%s, barge min RMS=%d, end silence=%dms",
+            "barge guard=%dms, max barge gap=%dms, cancel-on-VAD=%s, "
+            "barge min RMS=%d, end silence=%dms",
             vad_aggressiveness, self.ring_buffer_size * 20,
             self.num_speech_frames_threshold * 20,
             self.num_barge_in_frames_threshold * 20,
             self.barge_in_guard_ms,
+            self.barge_in_max_gap_frames * 20,
             self.cancel_barge_in_on_vad,
             self.barge_in_min_rms,
             self.num_silent_frames_threshold * 20,
@@ -853,6 +861,7 @@ class NoiseRobustSTT:
         captured = []
         streaming = None
         speech_frames = 0
+        candidate_gap_frames = 0
         silent_frames = 0
         generation = None
         was_barge_in = False
@@ -871,6 +880,7 @@ class NoiseRobustSTT:
                 logging.warning("Audio input overflow; resetting VAD candidate: %s", exc)
                 pre_roll.clear()
                 speech_frames = 0
+                candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
                 state = "IDLE"
@@ -881,6 +891,7 @@ class NoiseRobustSTT:
             if not audio_routing.enabled and tts_active_event.is_set():
                 pre_roll.clear()
                 speech_frames = 0
+                candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
                 state = "IDLE"
@@ -894,6 +905,7 @@ class NoiseRobustSTT:
                 # local speech and aborts TTS before AEC has converged.
                 pre_roll.clear()
                 speech_frames = 0
+                candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
                 state = "IDLE"
@@ -917,12 +929,21 @@ class NoiseRobustSTT:
                         candidate_during_tts = True
                     candidate_peak_rms = max(candidate_peak_rms, audio_rms)
                     speech_frames += 1
+                    candidate_gap_frames = 0
                     state = "BARGE_CANDIDATE"
                 else:
-                    speech_frames = 0
-                    candidate_during_tts = False
-                    candidate_peak_rms = 0.0
-                    state = "IDLE"
+                    candidate_gap_frames += 1
+                    allowed_gap_frames = (
+                        self.barge_in_max_gap_frames
+                        if candidate_during_tts else 0
+                    )
+                    if (state != "BARGE_CANDIDATE" or
+                            candidate_gap_frames > allowed_gap_frames):
+                        speech_frames = 0
+                        candidate_gap_frames = 0
+                        candidate_during_tts = False
+                        candidate_peak_rms = 0.0
+                        state = "IDLE"
 
                 required_frames = (
                     self.num_barge_in_frames_threshold
@@ -1406,7 +1427,7 @@ def stt_task_v8():
         py_audio=py_audio,
         sample_rate=native_rate,
         chunk_size=native_chunk,
-        vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "2")),
+        vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "1")),
         language_code=os.environ.get("LANGUAGE_CODE", "en-US"),
     )
     stream = py_audio.open(
@@ -2060,8 +2081,8 @@ def main():
     logging.info(
         "Barge-in: local WebRTC VAD with %sms confirmation after a %sms AEC guard; "
         "cancellation=%s",
-        os.environ.get("BARGE_IN_CONFIRM_MS", "160"),
-        os.environ.get("BARGE_IN_GUARD_MS", "100"),
+        os.environ.get("BARGE_IN_CONFIRM_MS", "100"),
+        os.environ.get("BARGE_IN_GUARD_MS", "80"),
         "immediate" if env_flag("BARGE_IN_CANCEL_ON_VAD", False) else "after STT validation",
     )
     logging.info("STT: Google Chirp 3 streaming with language identification")
