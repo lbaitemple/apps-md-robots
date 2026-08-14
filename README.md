@@ -40,35 +40,86 @@ For the video guide, please click the picture and refer to the demo video.
 [![Installation Guide](https://img.youtube.com/vi/1AkhJi2o8rM/0.jpg)](https://www.youtube.com/watch?v=1AkhJi2o8rM)
 
 
-Clone this repo, and install the dependencies. Full-duplex barge-in on Ubuntu
-24.04 uses PipeWire's PulseAudio compatibility layer and the ALSA Pulse plugin.
-```
+Clone this repo and install the system dependencies. Full-duplex barge-in on
+Ubuntu 24.04 uses PipeWire's PulseAudio compatibility layer, the ALSA Pulse
+plugin, and a logged-in user audio session.
+
+```bash
 cd ~
-git clone https://github.com/mangdangroboticsclub/apps-md-robots
+git clone -b physicalAI https://github.com/mangdangroboticsclub/apps-md-robots
 cd apps-md-robots
 sudo apt-get update
-sudo apt-get install -y python3-pyaudio pipewire pipewire-pulse wireplumber \
-    libspa-0.2-modules pulseaudio-utils libasound2-plugins
-sudo pip install -r requirements.txt
-
+sudo apt-get install -y \
+    build-essential python3-dev python3-venv portaudio19-dev libsndfile1 \
+    pipewire pipewire-pulse wireplumber libspa-0.2-modules \
+    pulseaudio-utils libasound2-plugins
 ```
 
-Set your google cloud API key in env.example file and then start.
+Install the Python packages in a virtual environment. Do not use `sudo pip` on
+Ubuntu 24.04. The requirements deliberately use only
+`opencv-python-headless`; installing another OpenCV wheel alongside it can make
+`cv2` require the unavailable desktop library `libGL.so.1`.
+
+```bash
+cd ~/apps-md-robots
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The pinned `langchain-google-vertexai==2.0.23` release requires
+`google-cloud-storage<3`. The `google-cloud-aiplatform` notice about future
+support for storage 2.x is therefore expected and does not stop the app. Do not
+upgrade storage to 3.x independently; update the LangChain integration and test
+the application at the same time.
+
+Start and verify the per-user audio services. Run these commands as the normal
+logged-in desktop/audio user, without `sudo`:
+
+```bash
+systemctl --user enable --now pipewire.service pipewire-pulse.service wireplumber.service
+systemctl --user --no-pager status pipewire.service pipewire-pulse.service wireplumber.service
+pactl info
+```
+
+`pactl info` must report a server before full-duplex barge-in can start. If it
+prints `Connection refused`, confirm that a user session bus exists:
+
+```bash
+printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' \
+    "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS"
+loginctl user-status "$USER"
+```
+
+Both environment values should be populated. Log in locally as the audio user
+and run the app from that session. Do not launch it with `sudo`; a root or
+system-service process normally cannot access the user's PipeWire server. For
+an SSH-only/headless installation, enable a persistent user session once, then
+log out and back in:
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+```
+
+Set your Google Cloud credentials in `.env`, then start the app.
  
-```
+```bash
 cp env.example .env
 
-#and then edit .env file, set your key path in .env file, like: API_KEY_PATH=/home/ubuntu/xxxx.josn 
+# Edit .env and set the JSON credential path, for example:
+# API_KEY_PATH=/home/ubuntu/credentials.json
 vim .env
-
-
-
 ```
 
 ## Run
-run app demos, eg. ai_apps
- 
-```
-cd ai_apps/
-python ai_app.py
+
+Activate the same virtual environment and run the desired demo as the logged-in
+audio user. For example:
+
+```bash
+cd ~/apps-md-robots
+source .venv/bin/activate
+python ai_app/ai_app8.py
 ```
