@@ -5,6 +5,7 @@ opencv-contrib-python==4.10.0.84
 opencv-python-headless==4.10.0.84
 pyaudio
 google-auth
+google-cloud-translate
 google-cloud-texttospeech
 google-cloud-speech
 langchain==0.3.22
