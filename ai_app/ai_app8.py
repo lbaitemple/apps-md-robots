@@ -13,47 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Description: Enhanced AI app with immediate VAD-based barge-in and visual feedback.
-# Speech onset cancels the current response before speech recognition completes.
-# Includes noise-robust speech-to-text using WebRTC VAD with visual status indicators.
-# Visual feedback: hello_y.png (calibration), hello_r.png (listening), hello_g.png (completed)
-# When speech is detected in a foreign language, TTS automatically responds in that language.
+# Description: Full-duplex multilingual assistant for Raspberry Pi.
+# PipeWire/PulseAudio's WebRTC AEC/NS removes this application's exact playback
+# signal before local WebRTC VAD decides whether a human is speaking. A new
+# utterance cancels stale TTS/LLM work after STT rejects residual playback echo.
 #
 
 import logging
 import os
 import time
 import re
+import atexit
+import subprocess
 import numpy as np
+from scipy.signal import resample_poly
 from PIL import Image
 import pyaudio
 import sounddevice as sd
 import soundfile as sf
 from io import BytesIO
-import asyncio
 import threading
 import queue as queue_module
-import subprocess
-import json
-import urllib.error
-import urllib.request
 from collections import deque
-import google.auth
-from google.api_core.client_options import ClientOptions
+from dataclasses import dataclass
 from google.cloud import texttospeech
-from google.cloud.speech_v2 import SpeechClient
-from google.cloud.speech_v2.types import cloud_speech
+from google.cloud import translate_v3
+from google.api_core.client_options import ClientOptions
+import google.auth
 from langchain_google_vertexai import ChatVertexAI
 import random
-import getpass
-from langchain.schema import HumanMessage, AIMessage, SystemMessage
-import noisereduce as nr
+from langchain.schema import HumanMessage, AIMessage
 import webrtcvad
 
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from task_queue import input_text_queue, output_text_queue, gif_queue, image_queue, movement_queue, stt_queue, heads_up_queue
+from task_queue import input_text_queue, output_text_queue, gif_queue, image_queue, movement_queue, heads_up_queue
 from api import media_api, google_api, move_api, shell_api
 
 
@@ -77,228 +72,17 @@ RPS_LOSE = {"Chinese": "你输了！", "Japanese": "あなたの負けです！"
             "Spanish": "¡Perdiste!", "French": "Vous avez perdu !", "German": "Du hast verloren!"}
 
 rps_game_lang = None  # language name of the current/last RPS game
-
-# Keywords that trigger the RPS game in each non-English language.
-# Any match fires the game; strings are checked as substrings of the transcript.
-RPS_TRIGGERS = {
-    "Chinese":  ["石头剪刀布", "石头", "剪刀"],
-    "Japanese": ["じゃんけん", "グー", "チョキ", "パー"],
-    "Korean":   ["가위바위보", "바위", "가위"],
-    "Spanish":  ["piedra", "papel", "tijeras"],
-    "French":   ["pierre", "feuille", "ciseaux"],
-    "German":   ["stein", "schere", "papier"],
-}
 ai_on = True
 
-# Barge-in settings.  MIN_SPEECH_MS validates the completed utterance; it does
-# not delay the speech-start event that interrupts playback.
-VAD_THRESH = float(os.environ.get("VAD_THRESH", "0.6"))
-MIN_SPEECH_MS = int(os.environ.get("MIN_SPEECH_MS", "500"))
-MIN_SILENCE_MS = int(os.environ.get("MIN_SILENCE_MS", "1200"))
-
-# Response/audio generation control (the local equivalent of audioGeneration).
-# A speech-start edge increments it, making older queued/in-flight work stale.
+# A generation changes as soon as local VAD confirms a new human utterance.
+# Anything produced for an older generation is stale and must not be spoken.
+generation_lock = threading.Lock()
+current_generation = 0
 tts_interrupt_flag = threading.Event()
-response_state_lock = threading.Lock()
-response_generation = 0
-tts_active = False
-llm_active = False
-echo_cancellation_enabled = False
-
-
-def current_response_generation():
-    with response_state_lock:
-        return response_generation
-
-
-def generation_is_current(generation):
-    return generation == current_response_generation()
-
-
-def clear_queue(work_queue):
-    """Remove queued work while keeping Queue.join() accounting correct."""
-    cleared = 0
-    while True:
-        try:
-            work_queue.get_nowait()
-            work_queue.task_done()
-            cleared += 1
-        except queue_module.Empty:
-            return cleared
-
-
-def handle_speech_started():
-    """Handle the local equivalent of input_audio_buffer.speech_started."""
-    global response_generation
-
-    with response_state_lock:
-        response_generation += 1
-        generation = response_generation
-
-    tts_interrupt_flag.set()
-    try:
-        sd.stop()
-    except Exception as exc:
-        logging.debug(f"Audio stop during barge-in failed: {exc}")
-
-    cleared = clear_queue(output_text_queue)
-    cleared_prompts = clear_queue(input_text_queue)
-    logging.info(
-        "input_audio_buffer.speech_started: cancelled response generation %s; "
-        "cleared %s queued audio item(s) and %s stale prompt(s)",
-        generation - 1,
-        cleared,
-        cleared_prompts,
-    )
-    threading.Thread(target=interrupt_livetalking, daemon=True).start()
-    return generation
-
-
-def queue_tts(text, generation=None):
-    """Queue speech only if it belongs to the current response generation."""
-    if not text:
-        return False
-    if generation is None:
-        generation = current_response_generation()
-    if not generation_is_current(generation):
-        logging.info("Discarding stale TTS response from generation %s", generation)
-        return False
-    output_text_queue.put((generation, text))
-    return True
-
-
-def queue_llm(text, generation=None):
-    """Queue a recognized user turn with its speech-start generation."""
-    if not text:
-        return False
-    if generation is None:
-        generation = current_response_generation()
-    input_text_queue.put((generation, text))
-    return True
-
-
-def unpack_generation_item(item):
-    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int):
-        return item
-    return current_response_generation(), item
-
-
-def interrupt_livetalking():
-    """Tell a local/remote LiveTalking avatar to drop unsent speech."""
-    base_url = os.environ.get(
-        "LIVETALKING_BASE_URL", "http://127.0.0.1:8010").rstrip("/")
-    if not base_url:
-        return
-    session_id = os.environ.get("LIVETALKING_SESSION_ID", "0")
-    try:
-        session_id = int(session_id)
-    except ValueError:
-        pass
-    payload = json.dumps({"sessionid": session_id}).encode("utf-8")
-    request = urllib.request.Request(
-        f"{base_url}/interrupt_talk",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=1.5) as response:
-            response.read()
-        logging.info("LiveTalking /interrupt_talk sent for session %s", session_id)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        logging.debug("LiveTalking interrupt unavailable: %s", exc)
-
-
-def configure_echo_cancellation():
-    """Enable PulseAudio/PipeWire's WebRTC echo-cancel source on Ubuntu."""
-    if os.environ.get("ENABLE_ECHO_CANCELLATION", "1").lower() in {"0", "false", "no"}:
-        logging.warning("Echo cancellation is disabled by ENABLE_ECHO_CANCELLATION")
-        return False
-
-    source_name = os.environ.get("AEC_SOURCE_NAME", "ai_app8_echo_cancel")
-    sink_name = os.environ.get("AEC_SINK_NAME", "ai_app8_echo_cancel_sink")
-    try:
-        modules = subprocess.run(
-            ["pactl", "list", "short", "modules"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-        if f"source_name={source_name}" not in modules:
-            command = [
-                "pactl", "load-module", "module-echo-cancel",
-                "aec_method=webrtc",
-                f"source_name={source_name}",
-                f"sink_name={sink_name}",
-                "source_properties=device.description=AI_App8_Echo_Cancel",
-                "sink_properties=device.description=AI_App8_Echo_Cancel_Sink",
-            ]
-            master_source = os.environ.get("AEC_MASTER_SOURCE")
-            master_sink = os.environ.get("AEC_MASTER_SINK")
-            if master_source:
-                command.append(f"source_master={master_source}")
-            if master_sink:
-                command.append(f"sink_master={master_sink}")
-            subprocess.run(command, check=True, capture_output=True, text=True, timeout=10)
-
-        # PortAudio's Pulse device honors these per-process routing variables.
-        os.environ["PULSE_SOURCE"] = source_name
-        os.environ["PULSE_SINK"] = sink_name
-        logging.info("WebRTC acoustic echo cancellation enabled: %s / %s", source_name, sink_name)
-        return True
-    except (FileNotFoundError, subprocess.SubprocessError) as exc:
-        logging.warning(
-            "Could not enable PulseAudio/PipeWire echo cancellation (%s). "
-            "Barge-in remains enabled; install pactl and module-echo-cancel or set "
-            "ENABLE_ECHO_CANCELLATION=0 to acknowledge the fallback.",
-            exc,
-        )
-        return False
-
-
-def choose_input_device(py_audio, prefer_pulse):
-    """Resolve an optional input device index/name, preferring Pulse for AEC."""
-    requested = os.environ.get("MIC_INPUT_DEVICE", "").strip()
-    if requested.isdigit():
-        return int(requested)
-
-    search = requested.lower()
-    fallback = None
-    for index in range(py_audio.get_device_count()):
-        info = py_audio.get_device_info_by_index(index)
-        if int(info.get("maxInputChannels", 0)) < 1:
-            continue
-        name = str(info.get("name", "")).lower()
-        if search and search in name:
-            return index
-        if prefer_pulse and ("pulse" in name or "pipewire" in name):
-            fallback = index
-
-    if requested:
-        raise RuntimeError(f"MIC_INPUT_DEVICE did not match an input device: {requested}")
-    return fallback
-
-
-def choose_output_device(prefer_pulse):
-    """Choose the Pulse/PipeWire output so its AEC sink receives TTS audio."""
-    requested = os.environ.get("TTS_OUTPUT_DEVICE", "").strip()
-    devices = sd.query_devices()
-    fallback = None
-    for index, info in enumerate(devices):
-        if int(info.get("max_output_channels", 0)) < 1:
-            continue
-        name = str(info.get("name", "")).lower()
-        if requested and (requested == str(index) or requested.lower() in name):
-            return index
-        if prefer_pulse and ("pulse" in name or "pipewire" in name):
-            fallback = index
-        elif not prefer_pulse and fallback is None and "headphone" in name:
-            fallback = index
-
-    if requested:
-        raise RuntimeError(f"TTS_OUTPUT_DEVICE did not match an output device: {requested}")
-    return fallback
+tts_active_event = threading.Event()
+tts_playback_started_at = 0.0
+tts_playback_text = ""
+audio_routing = None
 
 # Define voice parameters for different languages and a default voice
 voice0 = texttospeech.VoiceSelectionParams(language_code="en-US", name="en-US-Standard-E")
@@ -310,10 +94,11 @@ voice_DE = texttospeech.VoiceSelectionParams(language_code="de-DE", name="de-DE-
 voice_FR = texttospeech.VoiceSelectionParams(language_code="fr-FR", name="fr-FR-Standard-C")
 voice_HK = texttospeech.VoiceSelectionParams(language_code="yue-HK", name="yue-HK-Standard-C")
 voice_ES = texttospeech.VoiceSelectionParams(language_code="es-US", name="es-US-Wavenet-A")
-voice_IL = texttospeech.VoiceSelectionParams(language_code="es-US", name="he-IL-Standard-A")
+voice_IL = texttospeech.VoiceSelectionParams(language_code="he-IL", name="he-IL-Standard-A")
 voice_KR = texttospeech.VoiceSelectionParams(language_code="ko-KR", name="ko-KR-Neural2-A")
 
 lang_voices = {
+    "English": voice0,
     "Japanese": voice_JP,
     "Chinese": voice_CN,
     "Italian": voice_IT,
@@ -328,21 +113,31 @@ lang_voices = {
 # Mapping from Google STT language codes to lang_voices keys for auto-detection.
 # Only languages present in lang_voices are listed; all others fall back to default.
 lang_code_to_name = {
+    "en":      "English",
+    "en-US":   "English",
+    "en-GB":   "English",
     "ja-JP":   "Japanese",
+    "ja":      "Japanese",
     "cmn-CN":  "Chinese",
     "cmn-Hans-CN": "Chinese",
-    "cmn-Hant-TW": "Chinese",
     "zh-CN":   "Chinese",
     "zh-TW":   "Chinese",
+    "zh":      "Chinese",
     "it-IT":   "Italian",
+    "it":      "Italian",
     "de-DE":   "German",
+    "de":      "German",
     "fr-FR":   "French",
+    "fr":      "French",
     "yue-HK":  "Cantonese",
-    "yue-Hant-HK": "Cantonese",
+    "yue":     "Cantonese",
     "es-US":   "Spanish",
     "es-ES":   "Spanish",
+    "es":      "Spanish",
     "he-IL":   "Hebrew",
+    "he":      "Hebrew",
     "ko-KR":   "Korean",
+    "ko":      "Korean",
 }
 
 cur_voice = voice0
@@ -354,6 +149,495 @@ heads_up_questions = 0
 
 # Track last response for translation
 last_response = ""
+
+
+def env_flag(name, default=False):
+    """Read a conventional boolean environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass(frozen=True)
+class LanguageChoice:
+    name: str
+    code: str
+    voice: object
+
+
+@dataclass(frozen=True)
+class InputItem:
+    generation: int
+    text: str
+    language: LanguageChoice
+    command_text: str = ""
+
+
+@dataclass(frozen=True)
+class OutputItem:
+    generation: int
+    text: str
+    language: LanguageChoice
+
+
+DEFAULT_LANGUAGE = LanguageChoice("English", "en-US", voice0)
+generation_languages = {0: DEFAULT_LANGUAGE}
+
+
+def configure_default_language(code, voice_name):
+    """Apply the configured default voice to generation-aware queue items."""
+    global voice0, cur_voice, DEFAULT_LANGUAGE
+    voice0 = texttospeech.VoiceSelectionParams(language_code=code, name=voice_name)
+    cur_voice = voice0
+    normalized_code = code.replace("_", "-")
+    default_name = (
+        lang_code_to_name.get(normalized_code) or
+        lang_code_to_name.get(normalized_code.split("-", 1)[0]) or
+        "English"
+    )
+    lang_voices[default_name] = voice0
+    DEFAULT_LANGUAGE = LanguageChoice(default_name, code, voice0)
+    with generation_lock:
+        generation_languages[0] = DEFAULT_LANGUAGE
+
+
+def generation_is_current(generation):
+    with generation_lock:
+        return generation == current_generation
+
+
+def get_current_generation():
+    with generation_lock:
+        return current_generation
+
+
+def stop_tts_playback():
+    """Ask the active TTS callback to abort at its next audio block."""
+    tts_interrupt_flag.set()
+
+
+def transcript_matches_tts_echo(transcript, reference_text):
+    """Return True when a recognized barge-in is probably the current TTS."""
+    transcript_text = normalize_command_text(transcript)
+    reference = normalize_command_text(reference_text)
+    if not transcript_text or not reference:
+        return False
+
+    # This also handles languages that are commonly written without spaces.
+    if len(transcript_text) >= 8 and transcript_text in reference:
+        return True
+
+    transcript_words = transcript_text.split()
+    reference_words = set(reference.split())
+    if len(transcript_words) < 3:
+        return False
+    overlap = sum(word in reference_words for word in transcript_words)
+    return overlap / len(transcript_words) >= 0.8
+
+
+def begin_human_turn():
+    """Invalidate old work after a human utterance has been confirmed."""
+    global current_generation
+    with generation_lock:
+        current_generation += 1
+        generation = current_generation
+        generation_languages[generation] = DEFAULT_LANGUAGE
+        # Keep this dictionary bounded during a long-running session.
+        for old_generation in list(generation_languages):
+            if old_generation < generation - 8:
+                generation_languages.pop(old_generation, None)
+    stop_tts_playback()
+    logging.info("Human speech confirmed; generation %d cancels older work", generation)
+    return generation
+
+
+def set_generation_language(generation, language):
+    with generation_lock:
+        generation_languages[generation] = language
+
+
+def language_for_generation(generation):
+    with generation_lock:
+        return generation_languages.get(generation, DEFAULT_LANGUAGE)
+
+
+def enqueue_input(text, generation=None, language=None, command_text=None):
+    generation = get_current_generation() if generation is None else generation
+    language = language or language_for_generation(generation)
+    if command_text is None:
+        command_text = normalize_command_text(text)
+    input_text_queue.put(InputItem(generation, text, language, command_text))
+
+
+def enqueue_output(text, generation=None, language=None):
+    if not text:
+        return
+    generation = get_current_generation() if generation is None else generation
+    language = language or language_for_generation(generation)
+    output_text_queue.put(OutputItem(generation, str(text), language))
+
+
+class WebRTCAudioRouting:
+    """Create and verify a Pulse-compatible WebRTC AEC source/sink pair.
+
+    The output sink is the AEC far-end reference.  The paired source is the
+    microphone after WebRTC acoustic echo cancellation and noise suppression.
+    PULSE_SOURCE/PULSE_SINK route PortAudio through that exact pair.
+    """
+
+    def __init__(self):
+        self.enabled = env_flag("ENABLE_TTS_BARGE_IN", True)
+        self.required = env_flag("REQUIRE_WEBRTC_AEC", True)
+        self.source_name = os.environ.get("AEC_SOURCE_NAME", "ai_app8_echo_cancel")
+        self.sink_name = os.environ.get("AEC_SINK_NAME", "ai_app8_echo_cancel_sink")
+        self.module_id = None
+        self.loaded_here = False
+
+    @staticmethod
+    def _pactl(*args):
+        try:
+            return subprocess.run(
+                ["pactl", *args], check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ).stdout.strip()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "pactl is missing. Install pulseaudio-utils plus PipeWire's "
+                "audio modules before enabling full-duplex barge-in."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(f"pactl {' '.join(args)} failed: {detail}") from exc
+
+    @classmethod
+    def _names(cls, object_type):
+        rows = cls._pactl("list", "short", object_type).splitlines()
+        return {row.split("\t", 2)[1] for row in rows if "\t" in row}
+
+    def _matching_echo_module(self):
+        for row in self._pactl("list", "short", "modules").splitlines():
+            fields = row.split("\t", 3)
+            if len(fields) < 3 or fields[1] != "module-echo-cancel":
+                continue
+            arguments = fields[2]
+            if (f"source_name={self.source_name}" in arguments and
+                    f"sink_name={self.sink_name}" in arguments and
+                    "aec_method=webrtc" in arguments):
+                return fields[0]
+        return None
+
+    @staticmethod
+    def _validate_name(name, label):
+        if not name or any(ch.isspace() for ch in name):
+            raise RuntimeError(f"Invalid {label} name: {name!r}")
+
+    def setup(self):
+        if not self.enabled:
+            logging.warning(
+                "ENABLE_TTS_BARGE_IN=0: using safe half-duplex mode; the "
+                "microphone will pause during TTS."
+            )
+            return
+
+        self._validate_name(self.source_name, "AEC source")
+        self._validate_name(self.sink_name, "AEC sink")
+        try:
+            self._pactl("info")
+            sources = self._names("sources")
+            sinks = self._names("sinks")
+            source_exists = self.source_name in sources
+            sink_exists = self.sink_name in sinks
+            if source_exists != sink_exists:
+                raise RuntimeError(
+                    "Only one member of the configured AEC source/sink pair exists. "
+                    "Unload the stale module or choose new AEC_SOURCE_NAME/AEC_SINK_NAME values."
+                )
+
+            if source_exists and not self._matching_echo_module():
+                raise RuntimeError(
+                    "The configured source/sink names exist, but pactl does not show "
+                    "a matching module-echo-cancel with aec_method=webrtc."
+                )
+
+            if not source_exists:
+                master_source = os.environ.get("AEC_MASTER_SOURCE") or self._pactl("get-default-source")
+                master_sink = os.environ.get("AEC_MASTER_SINK") or self._pactl("get-default-sink")
+                if master_source.endswith(".monitor"):
+                    raise RuntimeError(
+                        f"Default input {master_source!r} is a monitor, not a microphone; "
+                        "set AEC_MASTER_SOURCE to the physical microphone source."
+                    )
+                if master_source == self.source_name or master_sink == self.sink_name:
+                    raise RuntimeError("AEC master devices cannot point back to the virtual AEC pair.")
+                if master_source not in sources:
+                    raise RuntimeError(f"AEC master source {master_source!r} was not found.")
+                if master_sink not in sinks:
+                    raise RuntimeError(f"AEC master sink {master_sink!r} was not found.")
+
+                module_args = [
+                    "load-module", "module-echo-cancel", "aec_method=webrtc",
+                    f"source_master={master_source}", f"sink_master={master_sink}",
+                    f"source_name={self.source_name}", f"sink_name={self.sink_name}",
+                    "rate=48000", "channels=1",
+                ]
+                aec_args = os.environ.get("WEBRTC_AEC_ARGS", "").strip()
+                if aec_args:
+                    module_args.append(f"aec_args={aec_args}")
+                self.module_id = self._pactl(*module_args)
+                self.loaded_here = True
+
+            sources = self._names("sources")
+            sinks = self._names("sinks")
+            if self.source_name not in sources or self.sink_name not in sinks:
+                raise RuntimeError("WebRTC AEC module loaded without creating the configured source/sink pair.")
+            if not self._matching_echo_module():
+                raise RuntimeError("Could not verify the loaded WebRTC module in pactl's module list.")
+
+            os.environ["PULSE_SOURCE"] = self.source_name
+            os.environ["PULSE_SINK"] = self.sink_name
+            logging.info(
+                "Verified WebRTC AEC/NS routing: capture=%s playback/reference=%s",
+                self.source_name, self.sink_name,
+            )
+        except RuntimeError:
+            if self.loaded_here:
+                self.close()
+            self.enabled = False
+            if self.required:
+                raise
+            logging.exception(
+                "AEC unavailable; REQUIRE_WEBRTC_AEC=0 permits safe half-duplex fallback."
+            )
+
+    def close(self):
+        if self.loaded_here and self.module_id:
+            try:
+                self._pactl("unload-module", self.module_id)
+            except RuntimeError as exc:
+                logging.warning("Could not unload AEC module %s: %s", self.module_id, exc)
+            self.loaded_here = False
+
+
+def audio_setup_error_message(exc):
+    return (
+        f"{exc}\n\nFull-duplex barge-in needs a running PulseAudio-compatible server. "
+        "On Ubuntu 24.04 install pipewire, pipewire-pulse, wireplumber, "
+        "libspa-0.2-modules and pulseaudio-utils, then run the app as the "
+        "logged-in audio user (not through sudo). A missing user session bus "
+        "must be fixed before pactl or systemctl --user can work."
+    )
+
+
+def select_pyaudio_input(py_audio, require_pulse):
+    """Select the Pulse/PipeWire PortAudio input routed by PULSE_SOURCE."""
+    requested = os.environ.get("MIC_INPUT_DEVICE", "").strip()
+    candidates = []
+    for index in range(py_audio.get_device_count()):
+        info = py_audio.get_device_info_by_index(index)
+        if int(info.get("maxInputChannels", 0)) > 0:
+            candidates.append((index, info))
+
+    if requested:
+        if requested.isdigit():
+            index = int(requested)
+            info = py_audio.get_device_info_by_index(index)
+            if int(info.get("maxInputChannels", 0)) < 1:
+                raise RuntimeError(f"MIC_INPUT_DEVICE={requested} has no input channels.")
+            if require_pulse and not any(
+                token in str(info.get("name", "")).casefold()
+                for token in ("pulse", "pipewire")
+            ):
+                raise RuntimeError("Full-duplex MIC_INPUT_DEVICE must be the Pulse/PipeWire device.")
+            return index, info
+        for index, info in candidates:
+            if requested.casefold() in str(info.get("name", "")).casefold():
+                if require_pulse and not any(
+                    token in str(info.get("name", "")).casefold()
+                    for token in ("pulse", "pipewire")
+                ):
+                    raise RuntimeError("Full-duplex MIC_INPUT_DEVICE must be the Pulse/PipeWire device.")
+                return index, info
+        raise RuntimeError(f"MIC_INPUT_DEVICE={requested!r} did not match a PortAudio input.")
+
+    if require_pulse:
+        for index, info in candidates:
+            name = str(info.get("name", "")).casefold()
+            if "pulse" in name or "pipewire" in name:
+                return index, info
+        raise RuntimeError(
+            "WebRTC AEC was created, but PortAudio has no Pulse/PipeWire input. "
+            "Install the ALSA Pulse plugin or set MIC_INPUT_DEVICE explicitly."
+        )
+
+    info = py_audio.get_default_input_device_info()
+    return int(info["index"]), info
+
+
+def select_sounddevice_output(require_pulse):
+    """Select the Pulse/PipeWire output routed by PULSE_SINK."""
+    requested = os.environ.get("TTS_OUTPUT_DEVICE", "").strip()
+    devices = sd.query_devices()
+    candidates = [
+        (index, info) for index, info in enumerate(devices)
+        if int(info.get("max_output_channels", 0)) > 0
+    ]
+    if requested:
+        if requested.isdigit():
+            index = int(requested)
+            if index >= len(devices) or int(devices[index].get("max_output_channels", 0)) < 1:
+                raise RuntimeError(f"TTS_OUTPUT_DEVICE={requested} is not an output device.")
+            if require_pulse and not any(
+                token in str(devices[index].get("name", "")).casefold()
+                for token in ("pulse", "pipewire")
+            ):
+                raise RuntimeError("Full-duplex TTS_OUTPUT_DEVICE must be the Pulse/PipeWire device.")
+            return index
+        for index, info in candidates:
+            if requested.casefold() in str(info.get("name", "")).casefold():
+                if require_pulse and not any(
+                    token in str(info.get("name", "")).casefold()
+                    for token in ("pulse", "pipewire")
+                ):
+                    raise RuntimeError("Full-duplex TTS_OUTPUT_DEVICE must be the Pulse/PipeWire device.")
+                return index
+        raise RuntimeError(f"TTS_OUTPUT_DEVICE={requested!r} did not match a SoundDevice output.")
+
+    if require_pulse:
+        for index, info in candidates:
+            name = str(info.get("name", "")).casefold()
+            if "pulse" in name or "pipewire" in name:
+                return index
+        raise RuntimeError(
+            "WebRTC AEC was created, but SoundDevice has no Pulse/PipeWire output. "
+            "Install the ALSA Pulse plugin or set TTS_OUTPUT_DEVICE explicitly."
+        )
+    return None
+
+
+def validate_portaudio_routing(require_pulse):
+    """Fail during startup instead of leaving dead audio worker threads behind."""
+    py_audio = pyaudio.PyAudio()
+    try:
+        input_index, input_info = select_pyaudio_input(py_audio, require_pulse)
+        output_index = select_sounddevice_output(require_pulse)
+        logging.info(
+            "PortAudio preflight passed: input=%d (%s), output=%s",
+            input_index, input_info.get("name"),
+            output_index if output_index is not None else "system default",
+        )
+    finally:
+        py_audio.terminate()
+
+
+class ChirpStreamingSession:
+    """One Google Speech-to-Text V2 Chirp stream, fed after local VAD fires."""
+
+    _END = object()
+
+    def __init__(self, sample_rate):
+        from google.cloud import speech_v2 as cloud_speech
+
+        self.cloud_speech = cloud_speech
+        credentials, detected_project = google.auth.default()
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or detected_project
+        if not project_id:
+            raise RuntimeError("Google credentials did not provide a project ID.")
+        location = os.environ.get("GOOGLE_STT_LOCATION", "us")
+        recognizer_id = os.environ.get("GOOGLE_STT_RECOGNIZER", "_")
+        self.recognizer = (
+            f"projects/{project_id}/locations/{location}/recognizers/{recognizer_id}"
+        )
+        endpoint = "speech.googleapis.com" if location == "global" else f"{location}-speech.googleapis.com"
+        self.client = cloud_speech.SpeechClient(
+            credentials=credentials,
+            client_options=ClientOptions(api_endpoint=endpoint),
+        )
+        self.sample_rate = sample_rate
+        self.audio_queue = queue_module.Queue()
+        self.transcript = ""
+        self.language_code = None
+        self.error = None
+        self.thread = None
+
+    def _requests(self):
+        speech = self.cloud_speech
+        language_codes = [
+            code.strip() for code in
+            os.environ.get("GOOGLE_STT_LANGUAGE_CODES", "auto").split(",")
+            if code.strip()
+        ] or ["auto"]
+        config = speech.RecognitionConfig(
+            explicit_decoding_config=speech.ExplicitDecodingConfig(
+                encoding=speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.sample_rate,
+                audio_channel_count=1,
+            ),
+            language_codes=language_codes,
+            model=os.environ.get("GOOGLE_STT_MODEL", "chirp_3"),
+            features=speech.RecognitionFeatures(enable_automatic_punctuation=True),
+        )
+        yield speech.StreamingRecognizeRequest(
+            recognizer=self.recognizer,
+            streaming_config=speech.StreamingRecognitionConfig(
+                config=config,
+                streaming_features=speech.StreamingRecognitionFeatures(
+                    interim_results=True,
+                ),
+            ),
+        )
+        while True:
+            chunk = self.audio_queue.get()
+            if chunk is self._END:
+                return
+            yield speech.StreamingRecognizeRequest(audio=chunk)
+
+    def _run(self):
+        try:
+            final_parts = []
+            interim = ""
+            for response in self.client.streaming_recognize(requests=self._requests()):
+                for result in response.results:
+                    if not result.alternatives:
+                        continue
+                    text = result.alternatives[0].transcript.strip()
+                    if getattr(result, "language_code", None):
+                        self.language_code = result.language_code
+                    if result.is_final:
+                        if text:
+                            final_parts.append(text)
+                        interim = ""
+                    else:
+                        interim = text
+            self.transcript = " ".join(final_parts).strip() or interim
+        except Exception as exc:
+            self.error = exc
+
+    def start(self, pre_roll):
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        for chunk in pre_roll:
+            self.feed(chunk)
+
+    def feed(self, chunk):
+        if self.thread:
+            self.audio_queue.put(chunk)
+
+    def finish(self):
+        if not self.thread:
+            return None, None
+        self.audio_queue.put(self._END)
+        timeout = float(os.environ.get("GOOGLE_STT_FINAL_TIMEOUT", "8"))
+        self.thread.join(timeout=max(1.0, timeout))
+        if self.thread.is_alive():
+            try:
+                self.client.transport.close()
+            except Exception:
+                pass
+            raise TimeoutError(f"Streaming STT did not finish within {timeout:.1f}s")
+        if self.error:
+            raise self.error
+        return self.transcript or None, self.language_code
 
 
 def show_status_image(status):
@@ -395,16 +679,15 @@ def show_status_image(status):
 
 class NoiseRobustSTT:
     """
-    Noise-robust speech-to-text for noisy environments.
-    Uses WebRTC VAD and advanced noise reduction with visual feedback.
+    VAD and utterance buffering over the WebRTC AEC/NS-cleaned source.
+
+    AEC/NS deliberately lives in the audio server so it receives the exact TTS
+    playback reference.  Local VAD is only a speech boundary detector; it is
+    not acoustic echo cancellation.
     """
 
     def __init__(self, speech_client, py_audio, sample_rate=16000, chunk_size=320,
-                 vad_aggressiveness=1, language_code="en-US",
-                 vad_threshold=VAD_THRESH, min_speech_ms=MIN_SPEECH_MS,
-                 min_silence_ms=MIN_SILENCE_MS, on_speech_started=None,
-                 project_id=None, location="us", recognizer="_",
-                 language_codes=None, final_timeout=8.0):
+                 vad_aggressiveness=1, language_code="en-US"):
         """
         Initialize noise-robust STT.
 
@@ -422,152 +705,40 @@ class NoiseRobustSTT:
         self.chunk_size = chunk_size
         self.channels = 1
         self.language_code = language_code
-        self.project_id = project_id
-        self.location = location
-        self.recognizer = recognizer
-        self.language_codes = language_codes or ["auto"]
-        self.final_timeout = final_timeout
-        self.vad_threshold = min(1.0, max(0.0, vad_threshold))
-        self.min_speech_ms = max(20, min_speech_ms)
-        self.min_silence_ms = max(20, min_silence_ms)
-        self.on_speech_started = on_speech_started
 
         # Initialize WebRTC VAD
         self.vad = webrtcvad.Vad(vad_aggressiveness)
         self.vad_frame_duration_ms = 20
-        self.vad_window_size = 5
-        self.vad_decisions = deque([0.0] * self.vad_window_size,
-                                   maxlen=self.vad_window_size)
-        self.last_vad_score = 0.0
 
         # VAD parameters for speech detection
-        self.num_silent_frames_threshold = max(
-            1, int(np.ceil(self.min_silence_ms / self.vad_frame_duration_ms)))
-        self.num_speech_frames_threshold = 2  # ~40ms to confirm speech
-
-                # Noise reduction settings (optimized for complex noise)
-        self.noise_profile = None
-        self.calibration_time = 2.0
-        self.noise_reduction_strength = 0.5  # Moderate - preserve speech clarity
-        self.use_stationary_noise = False
-        self.silence_threshold = 500
-        self.apply_noise_reduction = False  # Disabled by default - can cause audio to be too quiet
-        self.enable_noise_reduction = False  # Disabled - VAD + raw audio works better
-
-        # Speech detection state
-        self.ring_buffer = []
-        self.ring_buffer_size = 30  # Keep 30 frames (~0.6 seconds) before speech
-        self.consecutive_silent_frames = 0
-        self.consecutive_speech_frames = 0
-        self.is_currently_speaking = False
-
-        self.recognizer_path = (
-            f"projects/{self.project_id}/locations/{self.location}/"
-            f"recognizers/{self.recognizer}"
+        silence_ms = int(os.environ.get("VAD_END_SILENCE_MS", "450"))
+        start_confirm_ms = int(os.environ.get("VAD_START_CONFIRM_MS", "100"))
+        barge_in_confirm_ms = int(os.environ.get("BARGE_IN_CONFIRM_MS", "160"))
+        self.barge_in_guard_ms = max(0, int(os.environ.get("BARGE_IN_GUARD_MS", "100")))
+        self.num_silent_frames_threshold = max(1, silence_ms // self.vad_frame_duration_ms)
+        self.num_speech_frames_threshold = max(1, start_confirm_ms // self.vad_frame_duration_ms)
+        self.num_barge_in_frames_threshold = max(
+            self.num_speech_frames_threshold,
+            barge_in_confirm_ms // self.vad_frame_duration_ms,
         )
-        decoding_config = cloud_speech.ExplicitDecodingConfig(
-            encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=self.sample_rate,
-            audio_channel_count=self.channels,
-        )
-        recognition_config = cloud_speech.RecognitionConfig(
-            explicit_decoding_config=decoding_config,
-            language_codes=self.language_codes,
-            model="chirp_3",
-            features=cloud_speech.RecognitionFeatures(
-                enable_automatic_punctuation=True,
-            ),
-        )
-        self.streaming_config = cloud_speech.StreamingRecognitionConfig(
-            config=recognition_config,
-            streaming_features=cloud_speech.StreamingRecognitionFeatures(
-                interim_results=True,
-            ),
-        )
+        self.cancel_barge_in_on_vad = env_flag("BARGE_IN_CANCEL_ON_VAD", False)
+        self.barge_in_min_rms = max(0, int(os.environ.get("BARGE_IN_MIN_RMS", "300")))
+        self.silence_threshold = int(os.environ.get("VAD_RMS_FALLBACK_THRESHOLD", "500"))
+        pre_roll_ms = int(os.environ.get("PRE_ROLL_MS", "400"))
+        self.ring_buffer_size = max(10, pre_roll_ms // self.vad_frame_duration_ms)
 
         logging.info(
-            "Noise-Robust STT initialized (VAD threshold: %.2f, min speech: %sms, "
-            "min silence: %sms, WebRTC aggressiveness: %s, model: chirp_3, "
-            "languages: %s)",
-            self.vad_threshold,
-            self.min_speech_ms,
-            self.min_silence_ms,
-            vad_aggressiveness,
-            ",".join(self.language_codes),
+            "STT front end initialized: WebRTC VAD=%d, pre-roll=%dms, "
+            "speech confirmation=%dms, barge confirmation=%dms, "
+            "barge guard=%dms, cancel-on-VAD=%s, barge min RMS=%d, end silence=%dms",
+            vad_aggressiveness, self.ring_buffer_size * 20,
+            self.num_speech_frames_threshold * 20,
+            self.num_barge_in_frames_threshold * 20,
+            self.barge_in_guard_ms,
+            self.cancel_barge_in_on_vad,
+            self.barge_in_min_rms,
+            self.num_silent_frames_threshold * 20,
         )
-
-    def calibrate_noise(self, stream):
-        """
-        Calibrate noise profile from ambient sound with visual feedback.
-        """
-        # Show calibration status image
-        show_status_image('calibrating')
-
-        print("\n" + "="*60)
-        print("🎤 Calibrating noise profile for complex noise environment...")
-        print("="*60)
-        print("Please remain silent for 2 seconds to capture background noise...")
-        print("(This will help filter TV noise, dog barking, people talking, lawn mowers, etc.)")
-        print()
-
-        logging.info("Calibrating noise profile for noisy environment...")
-        logging.info("Capturing background noise (TV, dogs, people, lawn mowers, etc.)...")
-
-        noise_samples = []
-        frames_needed = int(self.sample_rate / self.chunk_size * self.calibration_time)
-
-        for i in range(frames_needed):
-            data = stream.read(self.chunk_size, exception_on_overflow=False)
-            audio_data = np.frombuffer(data, dtype=np.int16)
-            noise_samples.append(audio_data)
-
-            # Show progress
-            if (i + 1) % 8 == 0:
-                progress = (i + 1) / frames_needed * 100
-                print(f"  Capturing noise... {progress:.0f}%")
-
-        self.noise_profile = np.concatenate(noise_samples)
-
-        # Threshold = 2× noise floor, capped at 1000 so startup noise can't
-        # inflate it above normal speech levels (typical speech RMS > 1000).
-        noise_rms = np.sqrt(np.mean(self.noise_profile.astype(np.float32) ** 2))
-        self.silence_threshold = min(1000, max(200, noise_rms * 2.0))
-
-        print(f"\n✓ Noise calibration complete!")
-        print(f"  Detected noise level: {noise_rms:.0f}")
-        print(f"  Adaptive silence threshold: {self.silence_threshold:.0f}")
-        print("="*60 + "\n")
-
-        logging.info(f"Noise calibration complete! Noise level: {noise_rms:.0f}, Threshold: {self.silence_threshold:.0f}")
-
-        # Show ready status after calibration
-        show_status_image('ready')
-
-    def reduce_noise(self, audio_data):
-        """
-        Apply advanced noise reduction for complex noise environments.
-        """
-        if not self.enable_noise_reduction:
-            return audio_data
-
-        if self.noise_profile is not None and len(audio_data) > 0:
-            try:
-                reduced = nr.reduce_noise(
-                    y=audio_data.astype(np.float32),
-                    sr=self.sample_rate,
-                    y_noise=self.noise_profile.astype(np.float32),
-                    stationary=self.use_stationary_noise,
-                    prop_decrease=self.noise_reduction_strength,
-                    freq_mask_smooth_hz=500,  # Lower = preserve more speech
-                    time_mask_smooth_ms=50,   # Lower = preserve more speech transients
-                    n_fft=2048,
-                    clip_noise_stationary=True
-                )
-                return reduced.astype(np.int16)
-            except Exception as e:
-                logging.warning(f"Noise reduction failed: {e}")
-                return audio_data
-        return audio_data
 
     _VAD_RATE = 16000  # WebRTC VAD works reliably at 16 kHz
 
@@ -589,8 +760,6 @@ class NoiseRobustSTT:
         """
         Use WebRTC VAD to detect if audio chunk contains speech.
         Audio is resampled to 16 kHz so the VAD always receives a supported rate.
-        VAD_THRESH is applied to a rolling probability made from the last five
-        WebRTC decisions, so lowering it makes speech onset easier to trigger.
         """
         try:
             resampled = self._resample_to_vad_rate(audio_data)
@@ -599,263 +768,281 @@ class NoiseRobustSTT:
                 resampled = np.pad(resampled, (0, expected_size - len(resampled)), 'constant')
             else:
                 resampled = resampled[:expected_size]
-            raw_speech = self.vad.is_speech(resampled.tobytes(), self._VAD_RATE)
+            return self.vad.is_speech(resampled.tobytes(), self._VAD_RATE)
 
         except Exception as e:
             # Amplitude fallback — use a fixed low threshold so normal speech is detected
             rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
-            raw_speech = rms >= self.silence_threshold
-            logging.warning(f"VAD exception ({e}), amplitude fallback: RMS={rms:.0f} threshold={self.silence_threshold:.0f} speech={raw_speech}")
+            result = rms >= self.silence_threshold
+            logging.warning(f"VAD exception ({e}), amplitude fallback: RMS={rms:.0f} threshold={self.silence_threshold:.0f} speech={result}")
+            return result
 
-        self.vad_decisions.append(1.0 if raw_speech else 0.0)
-        self.last_vad_score = sum(self.vad_decisions) / len(self.vad_decisions)
-        return self.last_vad_score >= self.vad_threshold
-
-    def streaming_requests(self, audio_queue):
-        """Yield the Chirp 3 config first, followed by raw microphone chunks."""
-        yield cloud_speech.StreamingRecognizeRequest(
-            recognizer=self.recognizer_path,
-            streaming_config=self.streaming_config,
-        )
-        while True:
-            audio_bytes = audio_queue.get()
-            if audio_bytes is None:
-                return
-            # Speech-to-Text V2 limits each streaming audio request to 15 KB.
-            for offset in range(0, len(audio_bytes), 15000):
-                yield cloud_speech.StreamingRecognizeRequest(
-                    audio=audio_bytes[offset:offset + 15000]
-                )
-
-    def transcribe_stream(self, audio_queue, result_queue):
-        """Consume one Chirp 3 stream and return its final transcript."""
-        final_parts = []
-        latest_interim = ""
-        detected_language = self.language_code
-        confidence = 0.0
-        try:
-            responses = self.speech_client.streaming_recognize(
-                requests=self.streaming_requests(audio_queue)
-            )
-            for response in responses:
-                interim_parts = []
-                for result in response.results:
-                    if not result.alternatives:
-                        continue
-                    transcript = result.alternatives[0].transcript.strip()
-                    if not transcript:
-                        continue
-                    if result.language_code:
-                        detected_language = result.language_code
-                    if result.is_final:
-                        final_parts.append(transcript)
-                        confidence = result.alternatives[0].confidence
-                    else:
-                        interim_parts.append(transcript)
-                if interim_parts:
-                    latest_interim = " ".join(interim_parts)
-                    logging.debug("Chirp 3 interim transcript: %s", latest_interim)
-
-            transcript = " ".join(final_parts).strip() or latest_interim.strip()
-            result_queue.put((transcript or None, detected_language, confidence, None))
-        except Exception as exc:
-            result_queue.put((None, None, 0.0, exc))
-
-    def finish_transcription(self, audio_queue, worker, result_queue, wait=True):
-        """Close a microphone stream and optionally wait for Chirp's final result."""
-        audio_queue.put(None)
-        if not wait:
-            return None, None
-
-        worker.join(timeout=self.final_timeout)
-        if worker.is_alive():
-            logging.error(
-                "Timed out after %.1fs waiting for the Chirp 3 final transcript",
-                self.final_timeout,
-            )
-            return None, None
-        try:
-            transcript, detected_language, confidence, error = result_queue.get_nowait()
-        except queue_module.Empty:
-            logging.error("Chirp 3 stream ended without a transcription result")
-            return None, None
-        if error:
-            logging.error("Chirp 3 streaming transcription error: %s", error)
-            return None, None
-        if not transcript:
-            logging.warning("Chirp 3 returned no recognizable speech")
-            return None, None
-
-        logging.info(
-            "Chirp 3 transcription: '%s' (confidence: %.2f, detected lang: %s)",
-            transcript,
-            confidence,
-            detected_language,
-        )
-        return transcript, detected_language
-
-    def listen_once(self, stream):
+    def transcribe_audio(self, audio_bytes):
         """
-        Listen for one complete speech utterance using VAD with visual feedback.
-        Returns a tuple of (transcribed_text, detected_language_code), or (None, None).
+        Transcribe audio using Google Speech-to-Text API.
+        Returns a tuple of (transcript, detected_language_code).
         """
-        # Reset state
-        self.ring_buffer = []
-        self.consecutive_silent_frames = 0
-        self.consecutive_speech_frames = 0
-        self.is_currently_speaking = False
-        self.vad_decisions = deque([0.0] * self.vad_window_size,
-                                   maxlen=self.vad_window_size)
-        self.last_vad_score = 0.0
-        speech_frame_count = 0
-        speech_detected = False
-        audio_queue = None
-        result_queue = None
-        transcription_worker = None
-        transcription_closed = False
+        try:
+            from google.cloud import speech
 
-        logging.debug("Listening for speech with noise-robust VAD...")
+            # Log audio info
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+            duration = len(audio_array) / self.sample_rate
+            rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+            logging.info(f"Transcribing audio: duration={duration:.2f}s, RMS={rms:.0f}, size={len(audio_bytes)} bytes")
 
-        # Listen loop with timeout (max 30 seconds)
-        max_iterations = int(30 * self.sample_rate / self.chunk_size)
+            audio = speech.RecognitionAudio(content=audio_bytes)
 
-        for iteration in range(max_iterations):
-            try:
-                # Read audio chunk
-                data = stream.read(self.chunk_size, exception_on_overflow=False)
-                audio_data = np.frombuffer(data, dtype=np.int16)
+            model_type = "latest_short" if duration < 3.0 else "latest_long"
+            fallback_codes = [
+                code.strip() for code in os.environ.get(
+                    "GOOGLE_STT_FALLBACK_LANGUAGE_CODES",
+                    "es-ES,cmn-CN,fr-FR",
+                ).split(",")
+                if code.strip() and code.strip() != self.language_code
+            ][:3]
 
-                # Apply noise reduction
-                cleaned_audio = self.reduce_noise(audio_data)
+            config = speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=self.sample_rate,
+                language_code=self.language_code,
+                enable_automatic_punctuation=True,
+                model=model_type,
+                audio_channel_count=self.channels,
+                enable_spoken_punctuation=False,
+                enable_spoken_emojis=False,
+                alternative_language_codes=fallback_codes,
+            )
+            logging.debug(f"Using model: {model_type} for {duration:.2f}s audio")
 
-                # Use VAD to detect speech
-                is_speech = self.is_speech_vad(cleaned_audio)
+            response = self.speech_client.recognize(config=config, audio=audio)
 
-                # Periodic diagnostic log every ~5 seconds
-                frames_per_5s = int(5 * self.sample_rate / self.chunk_size)
-                if iteration > 0 and iteration % frames_per_5s == 0:
-                    rms = np.sqrt(np.mean(cleaned_audio.astype(np.float32) ** 2))
-                    logging.info(f"Listening... RMS={rms:.0f} threshold={self.silence_threshold:.0f} vad={is_speech} speaking={self.is_currently_speaking}")
-
-                if is_speech:
-                    self.consecutive_speech_frames += 1
-                    self.consecutive_silent_frames = 0
-
-                    # Confirm speech start after enough consecutive speech frames
-                    if not self.is_currently_speaking and self.consecutive_speech_frames >= self.num_speech_frames_threshold:
-                        self.is_currently_speaking = True
-                        if not speech_detected:
-                            ring_buffer_duration = len(self.ring_buffer) * 0.02
-                            logging.info(f"🎤 Speech detected! Streaming to Chirp 3... (captured {ring_buffer_duration:.2f}s pre-speech buffer)")
-                            speech_detected = True
-
-                            # Fire barge-in immediately at the VAD speech-start edge.
-                            # Chirp transcription starts now and runs while the
-                            # user is speaking; VAD still owns turn boundaries.
-                            if self.on_speech_started:
-                                self.on_speech_started()
-
-                            # Show listening status image
-                            show_status_image('listening')
-
-                            audio_queue = queue_module.Queue()
-                            result_queue = queue_module.Queue(maxsize=1)
-                            transcription_worker = threading.Thread(
-                                target=self.transcribe_stream,
-                                args=(audio_queue, result_queue),
-                                daemon=True,
-                            )
-                            transcription_worker.start()
-
-                            # Send the pre-speech buffer first to preserve the
-                            # beginning of the user's first word.
-                            if self.ring_buffer:
-                                logging.debug(f"Streaming {len(self.ring_buffer)} ring buffer frames")
-                                for buffered_audio in self.ring_buffer:
-                                    audio_queue.put(buffered_audio.tobytes())
-                                self.ring_buffer = []
-
-                    if self.is_currently_speaking:
-                        speech_frame_count += 1
-                    else:
-                        # Not speaking yet, maintain ring buffer
-                        self.ring_buffer.append(cleaned_audio)
-                        if len(self.ring_buffer) > self.ring_buffer_size:
-                            self.ring_buffer.pop(0)
-                else:
-                    self.consecutive_silent_frames += 1
-                    self.consecutive_speech_frames = 0
-
-                    # Show progress when detecting silence after speech
-                    if self.is_currently_speaking and self.consecutive_silent_frames % 10 == 0 and self.consecutive_silent_frames > 0:
-                        remaining = self.num_silent_frames_threshold - self.consecutive_silent_frames
-                        if remaining > 0:
-                            logging.debug(f"Silence detected: {self.consecutive_silent_frames}/{self.num_silent_frames_threshold} frames...")
-
-                    if not self.is_currently_speaking:
-                        # Maintain ring buffer
-                        self.ring_buffer.append(cleaned_audio)
-                        if len(self.ring_buffer) > self.ring_buffer_size:
-                            self.ring_buffer.pop(0)
-
-                # Once speech starts, stream every frame—including trailing
-                # silence—while local VAD independently finds the turn end.
-                if audio_queue is not None:
-                    audio_queue.put(cleaned_audio.tobytes())
-
-                # Check if speech ended
-                if self.is_currently_speaking and self.consecutive_silent_frames >= self.num_silent_frames_threshold:
-                    logging.info(f"Speech ended after {self.consecutive_silent_frames} silent frames (~{self.consecutive_silent_frames * 0.02:.1f}s). Processing...")
-
-                    # Show completion status image
-                    show_status_image('completed')
-
-                    speech_duration_ms = speech_frame_count * self.vad_frame_duration_ms
-                    if speech_duration_ms < self.min_speech_ms:
-                        logging.warning(
-                            "Speech too short (%sms, need %sms) - ignoring transcription",
-                            speech_duration_ms,
-                            self.min_speech_ms,
-                        )
-                        self.finish_transcription(
-                            audio_queue, transcription_worker, result_queue, wait=False)
-                        transcription_closed = True
-                        show_status_image('ready')
-                        return None, None
-
-                    transcription_closed = True
-                    transcript, detected_lang = self.finish_transcription(
-                        audio_queue, transcription_worker, result_queue)
-                    show_status_image('ready')
+            if response.results:
+                result = response.results[0]
+                if result.alternatives:
+                    transcript = result.alternatives[0].transcript
+                    confidence = result.alternatives[0].confidence
+                    try:
+                        detected_lang = result.language_code or self.language_code
+                    except Exception:
+                        detected_lang = self.language_code
+                    logging.info(f"Transcription: '{transcript}' (confidence: {confidence:.2%}, detected lang: {detected_lang})")
                     return transcript, detected_lang
+                else:
+                    logging.warning("No alternatives in transcription result")
+            else:
+                logging.warning("No results from Speech API - audio may be too quiet, too short, or not contain clear speech")
 
-            except Exception as e:
-                logging.error(f"Error during listening: {e}")
-                if audio_queue is not None and not transcription_closed:
-                    self.finish_transcription(
-                        audio_queue, transcription_worker, result_queue, wait=False)
-                show_status_image('ready')  # Return to ready state on error
-                return None, None
+            return None, None
 
-        # Timeout - no speech detected
-        logging.debug("Listening timeout - no speech detected")
-        if audio_queue is not None and not transcription_closed:
-            self.finish_transcription(
-                audio_queue, transcription_worker, result_queue, wait=False)
-        show_status_image('ready')  # Return to ready state on timeout
-        return None, None
+        except Exception as e:
+            logging.error(f"Transcription error: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return None, None
+
+    def listen_full_duplex(self, stream):
+        """Capture one cleaned utterance and stream it to multilingual STT.
+
+        Returns ``(transcript, language_code, generation, was_barge_in)``.  The
+        generation is allocated at VAD confirmation, before cloud STT returns,
+        so playback stops without a network round trip.
+        """
+        frame_ms = self.vad_frame_duration_ms
+        pre_roll = deque(maxlen=self.ring_buffer_size)
+        captured = []
+        streaming = None
+        speech_frames = 0
+        silent_frames = 0
+        generation = None
+        was_barge_in = False
+        candidate_during_tts = False
+        barge_in_reference = ""
+        candidate_peak_rms = 0.0
+        state = "IDLE"
+        max_frames = int(float(os.environ.get("MAX_UTTERANCE_SECONDS", "20")) * 1000 / frame_ms)
+        min_speech_frames = max(1, int(os.environ.get("MIN_SPEECH_MS", "300")) // frame_ms)
+        voiced_frames = 0
+
+        while True:
+            try:
+                data = stream.read(self.chunk_size, exception_on_overflow=False)
+            except OSError as exc:
+                logging.warning("Audio input overflow; resetting VAD candidate: %s", exc)
+                pre_roll.clear()
+                speech_frames = 0
+                candidate_during_tts = False
+                candidate_peak_rms = 0.0
+                state = "IDLE"
+                continue
+
+            # Without verified AEC, listening during TTS would let the robot
+            # interrupt itself.  Keep draining PortAudio, but discard the audio.
+            if not audio_routing.enabled and tts_active_event.is_set():
+                pre_roll.clear()
+                speech_frames = 0
+                candidate_during_tts = False
+                candidate_peak_rms = 0.0
+                state = "IDLE"
+                continue
+
+            tts_is_active = tts_active_event.is_set()
+            if (tts_is_active and tts_playback_started_at and
+                    (time.monotonic() - tts_playback_started_at) * 1000 < self.barge_in_guard_ms):
+                # Ignore the playback onset while the echo canceller adapts to
+                # the new far-end signal. This transient otherwise looks like
+                # local speech and aborts TTS before AEC has converged.
+                pre_roll.clear()
+                speech_frames = 0
+                candidate_during_tts = False
+                candidate_peak_rms = 0.0
+                state = "IDLE"
+                continue
+
+            audio_data = np.frombuffer(data, dtype=np.int16)
+            audio_rms = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
+            is_speech = self.is_speech_vad(audio_data)
+            if tts_is_active and audio_rms < self.barge_in_min_rms:
+                # WebRTC VAD can label faint residual far-end speech as voice.
+                # Require near-end energy as well before allowing local TTS
+                # cancellation; normal listening remains VAD-only.
+                is_speech = False
+
+            if state in {"IDLE", "BARGE_CANDIDATE"}:
+                pre_roll.append(data)
+                if is_speech:
+                    if speech_frames == 0:
+                        candidate_during_tts = tts_is_active
+                    elif tts_is_active:
+                        candidate_during_tts = True
+                    candidate_peak_rms = max(candidate_peak_rms, audio_rms)
+                    speech_frames += 1
+                    state = "BARGE_CANDIDATE"
+                else:
+                    speech_frames = 0
+                    candidate_during_tts = False
+                    candidate_peak_rms = 0.0
+                    state = "IDLE"
+
+                required_frames = (
+                    self.num_barge_in_frames_threshold
+                    if candidate_during_tts else self.num_speech_frames_threshold
+                )
+                if speech_frames < required_frames:
+                    continue
+
+                was_barge_in = candidate_during_tts
+                if was_barge_in and not self.cancel_barge_in_on_vad:
+                    generation = get_current_generation()
+                    barge_in_reference = tts_playback_text
+                    logging.info(
+                        "Barge-in candidate buffered; waiting for STT validation "
+                        "before cancelling generation %d",
+                        generation,
+                    )
+                else:
+                    generation = begin_human_turn()
+                    if was_barge_in:
+                        logging.info(
+                            "Immediate local barge-in accepted (peak RMS=%.0f, threshold=%d)",
+                            candidate_peak_rms,
+                            self.barge_in_min_rms,
+                        )
+                state = "LISTENING"
+                show_status_image("listening")
+                captured = list(pre_roll)
+                voiced_frames = speech_frames
+                logging.info(
+                    "VAD state BARGE_CANDIDATE -> LISTENING (%dms confirmed, %dms pre-roll)",
+                    speech_frames * frame_ms, len(pre_roll) * frame_ms,
+                )
+                try:
+                    streaming = ChirpStreamingSession(self.sample_rate)
+                    streaming.start(captured)
+                except Exception as exc:
+                    streaming = None
+                    logging.warning("Could not start Chirp streaming; buffered v1 STT fallback will be used: %s", exc)
+                continue
+
+            captured.append(data)
+            if streaming:
+                streaming.feed(data)
+
+            if is_speech:
+                voiced_frames += 1
+                silent_frames = 0
+            else:
+                silent_frames += 1
+
+            utterance_frames = len(captured)
+            speech_finished = silent_frames >= self.num_silent_frames_threshold
+            length_limit = utterance_frames >= max_frames
+            if not speech_finished and not length_limit:
+                continue
+
+            show_status_image("completed")
+            if voiced_frames < min_speech_frames:
+                logging.info("Ignoring %dms VAD event as too short", voiced_frames * frame_ms)
+                if streaming:
+                    try:
+                        streaming.finish()
+                    except Exception:
+                        pass
+                show_status_image("ready")
+                return None, None, generation, was_barge_in
+
+            full_audio = b"".join(captured)
+            transcript = None
+            detected_language = None
+            if streaming:
+                try:
+                    transcript, detected_language = streaming.finish()
+                except Exception as exc:
+                    logging.warning("Chirp streaming failed; retrying buffered audio with STT v1: %s", exc)
+            if not transcript:
+                transcript, detected_language = self.transcribe_audio(full_audio)
+
+            if was_barge_in and not self.cancel_barge_in_on_vad:
+                if not transcript:
+                    logging.info(
+                        "Ignoring untranscribed barge-in candidate; TTS was not interrupted"
+                    )
+                    show_status_image("ready")
+                    return None, None, generation, was_barge_in
+                if transcript_matches_tts_echo(transcript, barge_in_reference):
+                    logging.info(
+                        "Ignoring probable TTS echo transcript %r; TTS was not interrupted",
+                        transcript,
+                    )
+                    show_status_image("ready")
+                    return None, None, generation, was_barge_in
+                if not generation_is_current(generation):
+                    logging.info(
+                        "Discarding barge-in candidate for stale generation %d", generation
+                    )
+                    show_status_image("ready")
+                    return None, None, generation, was_barge_in
+                generation = begin_human_turn()
+                logging.info("Validated human barge-in transcript before cancelling TTS")
+
+            show_status_image("ready")
+            logging.info(
+                "STT finalized generation=%s language=%s transcript=%r",
+                generation, detected_language, transcript,
+            )
+            return transcript, detected_language, generation, was_barge_in
 
 
 # Track last response for translation
 last_response = ""
 
-def send_response(text, generation=None):
+def send_response(text, generation=None, language=None):
     """
     Send response to output queue and track it for potential translation.
     """
     global last_response
     last_response = text
-    queue_tts(text, generation)
+    enqueue_output(text, generation, language)
 
 
 #heads up ai prompt
@@ -895,6 +1082,8 @@ Let's begin. I have provided the secret word above. Await my first question afte
     return prompt
 
 def detect_lang_usage(prompt, lang):
+    prompt = prompt.casefold()
+    lang = lang.casefold()
     adjectives = ['food', 'culture', 'characters', 'novel', 'history']
     language_phrases = [f'in {lang}', f'to {lang}', f'say in {lang}', f'translate to {lang}']
 
@@ -919,7 +1108,10 @@ def detect_voice_from_transcript(transcript, stt_lang_code=None):
 
     # STT lang code is the most reliable signal — check it first.
     if stt_lang_code:
-        lang_name = lang_code_to_name.get(stt_lang_code)
+        normalized_code = stt_lang_code.replace("_", "-")
+        lang_name = lang_code_to_name.get(normalized_code)
+        if not lang_name:
+            lang_name = lang_code_to_name.get(normalized_code.split("-", 1)[0])
         if lang_name:
             voice = lang_voices.get(lang_name)
             if voice:
@@ -959,13 +1151,99 @@ def get_voice(prompt=None):
     if not prompt:
         logging.debug(f"select key voice: None,default is voice0")
         return None, voice0
+    folded_prompt = prompt.casefold()
     for key, value in lang_voices.items():
-        if key in prompt:
-            if detect_lang_usage(prompt, key) == "Language choice":
+        if key.casefold() in folded_prompt:
+            if detect_lang_usage(folded_prompt, key) == "Language choice":
                 logging.info(f"select key: {key}")
                 return key, value
     logging.info(f"no mapping, default is voice0")
     return None, voice0
+
+
+LANGUAGE_TTS_CODES = {
+    "English": "en-US",
+    "Japanese": "ja-JP",
+    "Chinese": "cmn-CN",
+    "Italian": "it-IT",
+    "German": "de-DE",
+    "French": "fr-FR",
+    "Cantonese": "yue-HK",
+    "Spanish": "es-US",
+    "Hebrew": "he-IL",
+    "Korean": "ko-KR",
+}
+
+
+def choose_language(transcript, stt_language_code=None):
+    """Choose one dominant response/TTS language for this utterance.
+
+    An explicit request such as "reply in Japanese" wins. Otherwise Chirp's
+    language ID is primary and Unicode script detection is the fallback. Mixed
+    speech is therefore transcribed as a whole and follows its dominant STT
+    language rather than switching voices in the middle of one sentence.
+    """
+    requested_name, requested_voice = get_voice(transcript)
+    if requested_name:
+        return LanguageChoice(
+            requested_name,
+            LANGUAGE_TTS_CODES[requested_name],
+            requested_voice,
+        )
+
+    voice = detect_voice_from_transcript(transcript, stt_language_code)
+    if voice:
+        language_name = next(
+            (name for name, candidate in lang_voices.items() if candidate == voice),
+            "English",
+        )
+        return LanguageChoice(
+            language_name,
+            LANGUAGE_TTS_CODES[language_name],
+            voice,
+        )
+    return DEFAULT_LANGUAGE
+
+
+def with_language_instruction(text, language):
+    if language.name == "English":
+        return text
+    return f"{text}\nReply naturally and concisely in {language.name}."
+
+
+def normalize_command_text(text):
+    """Normalize an English translation before deterministic intent matching."""
+    without_punctuation = re.sub(r"[^\w\s']", " ", text.casefold())
+    return re.sub(r"\s+", " ", without_punctuation).strip()
+
+
+class CommandTranslator:
+    """Translate each transcript to English solely for command routing."""
+
+    def __init__(self):
+        credentials, detected_project = google.auth.default()
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or detected_project
+        if not project_id:
+            raise RuntimeError("Google credentials did not provide a project ID for translation.")
+        self.client = translate_v3.TranslationServiceClient(credentials=credentials)
+        self.parent = f"projects/{project_id}/locations/global"
+
+    def to_english(self, text):
+        response = self.client.translate_text(
+            request={
+                "parent": self.parent,
+                "contents": [text],
+                "mime_type": "text/plain",
+                "target_language_code": "en",
+            },
+            timeout=float(os.environ.get("GOOGLE_TRANSLATE_TIMEOUT", "5")),
+        )
+        if not response.translations:
+            raise RuntimeError("Cloud Translation returned no translation.")
+        translated = response.translations[0].translated_text.strip()
+        if not translated:
+            raise RuntimeError("Cloud Translation returned an empty translation.")
+        return translated
 
 move_cmd_functions = {
                  "action": move_api.init_movement,
@@ -984,6 +1262,23 @@ move_cmd_functions = {
                  "look lower right": move_api.look_rightlower,
              }
 
+move_command_aliases = {
+    "move forward": "move forwards",
+    "walk forward": "move forwards",
+    "go forward": "move forwards",
+    "move backward": "move backwards",
+    "walk backward": "move backwards",
+    "go backward": "move backwards",
+    "move to the left": "move left",
+    "go left": "move left",
+    "move to the right": "move right",
+    "go right": "move right",
+    "look to the left": "look left",
+    "look to the right": "look right",
+    "look upward": "look up",
+    "look downward": "look down",
+}
+
 def get_move_cmd(input_text, command_dict):
     """
     Find the command key in the input text based on the command dictionary.
@@ -993,21 +1288,23 @@ def get_move_cmd(input_text, command_dict):
     for command_key in command_dict.keys():
         if re.search(r'\b' + re.escape(command_key) + r'\b', input_text):
             return command_key
+    for translated_phrase, command_key in move_command_aliases.items():
+        if re.search(r'\b' + re.escape(translated_phrase) + r'\b', input_text):
+            return command_key
     return None
 
 def close_ai():
     global ai_on
     ai_on = False
-    stt_queue.put(True)
+    stop_tts_playback()
     image = Image.open(f"{RES_DIR}/logo2.png")
     image_queue.put(image)
 
 def open_ai():
     global ai_on
     ai_on = True
-    stt_queue.put(True)
     show_status_image('ready')
-    queue_tts("OK, my friend.")
+    enqueue_output("OK, my friend.")
 
 def reboot():
     command = "sudo reboot"
@@ -1019,9 +1316,13 @@ def power_off():
 
 sys_cmds_functions = {
         "shut up": close_ai,
+        "be quiet": close_ai,
         "speak please": open_ai,
+        "start speaking": open_ai,
         "reboot": reboot,
         "power off": power_off,
+        "turn off": power_off,
+        "shut down": power_off,
         }
 
 def get_sys_cmd(input_text, command_dict):
@@ -1085,255 +1386,153 @@ def remove_asterisk_text(text):
     return asterisk_pattern.sub('', text)
 
 
-def stt_task():
-    """
-    Enhanced task for noise-robust speech-to-text conversion with visual feedback.
-    Uses WebRTC VAD and advanced noise reduction for noisy environments.
-    Automatically switches TTS voice to match foreign language detected in speech.
-    """
-    logging.debug("Enhanced noise-robust STT task start.")
+def stt_task_v8():
+    """Continuously listen to the AEC/NS source, including while TTS plays."""
+    global cur_voice, rps_game_lang
+
+    logging.info("Starting full-duplex WebRTC AEC/NS -> VAD -> streaming STT front end")
     py_audio = google_api.init_pyaudio()
-    credentials, detected_project_id = google.auth.default()
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or detected_project_id
-    if not project_id:
-        raise RuntimeError(
-            "Chirp 3 requires GOOGLE_CLOUD_PROJECT or a project_id in Google credentials"
-        )
-    stt_location = os.environ.get("GOOGLE_STT_LOCATION", "us")
-    speech_client = SpeechClient(
-        credentials=credentials,
-        client_options=ClientOptions(
-            api_endpoint=f"{stt_location}-speech.googleapis.com",
-        ),
-    )
-    stt_languages = [
-        code.strip()
-        for code in os.environ.get("GOOGLE_STT_LANGUAGE_CODES", "auto").split(",")
-        if code.strip()
-    ]
-    logging.info(
-        "Initialized Google STT V2 Chirp 3 (project=%s, location=%s, languages=%s)",
-        project_id,
-        stt_location,
-        ",".join(stt_languages),
-    )
-
-    # Get language settings
-    lang_code = os.environ.get('LANGUAGE_CODE', 'en-US')
-
-    # Detect the hardware's native sample rate to avoid paInvalidSampleRate
-    input_device_index = choose_input_device(py_audio, echo_cancellation_enabled)
-    if input_device_index is None:
-        device_info = py_audio.get_default_input_device_info()
-    else:
-        device_info = py_audio.get_device_info_by_index(input_device_index)
-    logging.info("Microphone input device: %s", device_info.get("name", input_device_index))
-    native_rate = int(device_info['defaultSampleRate'])  # e.g. 48000 on Google Voice HAT
-    # VAD requires exactly 10/20/30 ms frames; 20 ms at native_rate samples
+    speech_client = google_api.init_speech_to_text()  # buffered fallback
+    input_index, device_info = select_pyaudio_input(py_audio, audio_routing.enabled)
+    native_rate = int(device_info["defaultSampleRate"])
     native_chunk = int(native_rate * 0.020)
-
-    # Initialize noise-robust STT
-    noise_robust_stt = NoiseRobustSTT(
+    logging.info(
+        "Capture device %d (%s), %d Hz through PULSE_SOURCE=%s",
+        input_index, device_info.get("name"), native_rate,
+        os.environ.get("PULSE_SOURCE", "system default"),
+    )
+    recognizer = NoiseRobustSTT(
         speech_client=speech_client,
         py_audio=py_audio,
         sample_rate=native_rate,
         chunk_size=native_chunk,
-        vad_aggressiveness=0,  # 0-3: 0 = most sensitive to speech
-        language_code=lang_code,
-        vad_threshold=VAD_THRESH,
-        min_speech_ms=MIN_SPEECH_MS,
-        min_silence_ms=MIN_SILENCE_MS,
-        on_speech_started=handle_speech_started,
-        project_id=project_id,
-        location=stt_location,
-        recognizer=os.environ.get("GOOGLE_STT_RECOGNIZER", "_"),
-        language_codes=stt_languages,
-        final_timeout=float(os.environ.get("GOOGLE_STT_FINAL_TIMEOUT", "8")),
+        vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "2")),
+        language_code=os.environ.get("LANGUAGE_CODE", "en-US"),
     )
-
-    # Open audio stream
     stream = py_audio.open(
         format=pyaudio.paInt16,
         channels=1,
         rate=native_rate,
         input=True,
+        input_device_index=input_index,
         frames_per_buffer=native_chunk,
-        input_device_index=input_device_index,
     )
+    show_status_image("ready")
 
-    # Calibrate noise profile once at startup with visual feedback
-    print("\n" + "="*60)
-    print("🎤 NOISE-ROBUST SPEECH-TO-TEXT WITH VISUAL FEEDBACK")
-    print("="*60)
-    noise_robust_stt.calibrate_noise(stream)
-    print("✅ System ready for speech recognition!")
-    print("🎙️  Using: WebRTC VAD (Voice Activity Detection)")
-    print("☁️  STT: Google Speech-to-Text V2 streaming with Chirp 3")
-    print(f"⏱️  Auto-stops after {MIN_SILENCE_MS / 1000:.1f}s of silence")
-    print(f"🛑 VAD barge-in threshold: {VAD_THRESH:.1f} (before transcription)")
-    print(f"🗣️  Minimum valid speech: {MIN_SPEECH_MS}ms")
-    print("🎯 Captures first word with 0.6s pre-speech buffer")
-    print("🟡 Yellow: Calibrating noise profile")
-    print("🔴 Red: Actively listening to speech")
-    print("🟢 Green: Speech processing completed")
-    print("⚪ White: Ready for next command")
-    print("="*60 + "\n")
-    logging.info("Calibration complete! Ready for speech recognition with visual feedback.")
+    try:
+        command_translator = CommandTranslator()
+        logging.info("Cloud Translation command normalization is ready")
+    except Exception:
+        command_translator = None
+        logging.exception(
+            "Command translation is unavailable; non-English text will remain "
+            "conversational and will not trigger robot/system actions"
+        )
 
+    interrupt_phrases = {
+        "stop", "enough", "that is enough", "that's enough", "be quiet",
+        "shut up",
+    }
     while True:
-        # Listening stays active during both LLM generation and TTS playback.
-        # Legacy queue signals are drained for compatibility with the command
-        # handlers, but they no longer gate microphone capture.
-        while not stt_queue.empty():
-            stt_queue.get()
-            stt_queue.task_done()
-
-        logging.debug("stt task start loop, listening with noise-robust VAD...")
-
-        # Use noise-robust STT with VAD and visual feedback; returns (transcript, lang_code)
-        user_input, detected_lang_code = noise_robust_stt.listen_once(stream)
-        logging.debug(f"voice input: {user_input}, detected lang: {detected_lang_code}")
-
-        # Handle None input
+        user_input, detected_code, generation, was_barge_in = recognizer.listen_full_duplex(stream)
         if not user_input:
-            logging.debug(f"no input!")
+            continue
+        if not generation_is_current(generation):
+            logging.info("Discarding stale STT result for generation %d", generation)
             continue
 
-        move_key = get_move_cmd(user_input, move_cmd_functions)
-        sys_cmd_key, sys_cmd_func = get_sys_cmd(user_input, sys_cmds_functions)
-        global cur_voice, last_response
-        if ai_on:
-            lang, cur_voice = get_voice(user_input)
-            # Auto-detect foreign language from speech when no explicit language was requested.
-            # Uses Unicode script ranges (reliable for CJK) + STT lang code (Latin scripts).
-            if not lang:
-                auto_voice = detect_voice_from_transcript(user_input, detected_lang_code)
-                if auto_voice:
-                    logging.info(f"Auto-detected foreign language voice from transcript, switching TTS voice")
-                    cur_voice = auto_voice
+        spoken_language = choose_language(user_input, detected_code)
+        command_text = ""
+        if command_translator:
+            try:
+                english_translation = command_translator.to_english(user_input)
+                command_text = normalize_command_text(english_translation)
+                logging.info("English command translation: %r", command_text)
+            except Exception:
+                logging.exception("Translation failed for generation %d", generation)
+                if spoken_language.name == "English":
+                    command_text = normalize_command_text(user_input)
+                    logging.warning("Using the original English transcript for command matching")
                 else:
-                    cur_voice = voice0
+                    logging.warning("Suppressing action matching for the untranslated transcript")
+        elif spoken_language.name == "English":
+            command_text = normalize_command_text(user_input)
+
+        if was_barge_in and any(
+            command_text == phrase or command_text.startswith(f"{phrase} ")
+            for phrase in interrupt_phrases
+        ):
+            logging.info("Barge-in stop command transcribed; remaining silent")
+            continue
+
+        requested_name, requested_voice = get_voice(command_text)
+        if requested_name:
+            language = LanguageChoice(
+                requested_name,
+                LANGUAGE_TTS_CODES[requested_name],
+                requested_voice,
+            )
+        else:
+            language = spoken_language
+        set_generation_language(generation, language)
+        cur_voice = language.voice  # compatibility for game code outside the queues
+        logging.info(
+            "Generation %d language=%s (%s), STT reported=%s",
+            generation, language.name, language.code, detected_code,
+        )
+
+        move_key = get_move_cmd(command_text, move_cmd_functions)
+        sys_cmd_key, sys_cmd_func = get_sys_cmd(command_text, sys_cmds_functions)
 
         if playing_heads_up:
-            logging.debug(f"put voice text to input queue, heads up: {user_input}")
-            queue_llm(user_input)
-            time.sleep(0.5)
-            continue
+            enqueue_input(user_input, generation, language, command_text)
         elif sys_cmd_key:
-            logging.debug(f"sys cmd: {sys_cmd_key}")
             sys_cmd_func()
-        elif "sit" == move_key or "action" == move_key:
+        elif move_key in {"sit", "action"}:
             movement_queue.put(move_key)
-            queue_tts("OK, my friend.")
-        elif "walk" in user_input or "come" in user_input:
+            enqueue_output("OK, my friend.", generation, language)
+        elif "walk" in command_text or "come" in command_text:
             movement_queue.put("move forwards")
-            queue_tts("My friend, here I come.")
+            enqueue_output("My friend, here I come.", generation, language)
         elif move_key:
             movement_queue.put(move_key)
-            queue_tts(f"OK, my friend, {move_key} immediatly.")
+            enqueue_output(f"OK, my friend, {move_key} immediately.", generation, language)
         elif not ai_on:
-            logging.info(f"ai is not on, do not use gemini")
-            stt_queue.put(True)
-            time.sleep(0.5)
             continue
-        elif ("heads up" in user_input and "play" in user_input) or \
-             ("玩" in user_input and ("猜词" in user_input or "举牌" in user_input or "抬头" in user_input)):
-            queue_llm(user_input)
-            stt_queue.put(False)
-        elif ("don't want" in user_input.lower() and "play" in user_input.lower()) or \
-             ("do not want" in user_input.lower() and "play" in user_input.lower()) or \
-             ("exit" in user_input.lower()) or \
-             ("quit" in user_input.lower()) or \
-             ("stop" in user_input.lower() and ("game" in user_input.lower() or "playing" in user_input.lower())) or \
-             "退出" in user_input or "不玩了" in user_input or \
-             ("停止" in user_input and "游戏" in user_input) or "结束游戏" in user_input:
-            queue_llm(user_input)
-            stt_queue.put(False)
-        elif ("rock" in user_input or "paper" in user_input or "scissors" in user_input) or \
-             ("game" in user_input and "play" in user_input) or "play" in user_input or \
-             any(kw in user_input for kws in RPS_TRIGGERS.values() for kw in kws):
-            global rps_game_lang
-            rps_game_lang = next((n for n, v in lang_voices.items() if v == cur_voice), None)
-            queue_tts(GAME_TEXTS.get(rps_game_lang, GAME_TEXT))
-        elif lang:
-            # Check if user wants to translate the last response
-            if last_response and any(phrase in user_input.lower() for phrase in ["say that", "repeat that", "translate that", "say it", "repeat it"]):
-                logging.info(f"Translating last response to {lang}")
-                translation_request = f"Translate this to {lang}: {last_response}"
-                queue_llm(translation_request)
-                stt_queue.put(False)
-            else:
-                # Regular language switching for new question
-                logging.debug(f"switch language: {lang}")
-                user_input += f", Please reply in {lang}."
-                queue_llm(user_input)
-                stt_queue.put(False)
-        elif "test" in user_input:
-            queue_tts("test")
+        elif "heads up" in command_text and "play" in command_text:
+            enqueue_input(user_input, generation, language, command_text)
+        elif (("don't want" in command_text and "play" in command_text) or
+              ("do not want" in command_text and "play" in command_text) or
+              "exit" in command_text or "quit" in command_text or
+              ("stop" in command_text and
+               ("game" in command_text or "playing" in command_text))):
+            enqueue_input(user_input, generation, language, command_text)
+        elif (any(word in command_text for word in ("rock", "paper", "scissors")) or
+              ("game" in command_text and "play" in command_text)):
+            rps_game_lang = language.name
+            enqueue_output(GAME_TEXTS.get(rps_game_lang, GAME_TEXT), generation, language)
+        elif requested_name and last_response and any(
+            phrase in command_text for phrase in
+            ("say that", "repeat that", "translate that", "say it", "repeat it")
+        ):
+            enqueue_input(
+                f"Translate this to {language.name}: {last_response}",
+                generation, language, command_text,
+            )
+        elif "test" == command_text:
+            enqueue_output("test", generation, language)
         else:
-            logging.debug(f"put voice text to input queue: {user_input}")
-            queue_llm(user_input)
-            stt_queue.put(False)
-
-        time.sleep(0.5)
-
-
-def chunk_text(chunk):
-    content = getattr(chunk, "content", chunk)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in content
-        )
-    return str(content)
-
-
-def cancellable_chat_response(model, messages, generation):
-    """Stream a model call so a VAD generation change can close it early."""
-    global llm_active
-
-    if not generation_is_current(generation):
-        return None
-    stream = None
-    parts = []
-    llm_active = True
-    try:
-        stream = model.stream(messages)
-        for chunk in stream:
-            if not generation_is_current(generation):
-                logging.info("Cancelling in-progress LLM stream for generation %s", generation)
-                return None
-            parts.append(chunk_text(chunk))
-    finally:
-        llm_active = False
-        close = getattr(stream, "close", None)
-        if close:
-            close()
-
-    if not generation_is_current(generation):
-        return None
-    return "".join(parts).strip()
-
-
-def cancellable_ai_text_response(conversation, input_text, generation):
-    """Run the existing ConversationChain prompt/memory through a cancellable stream."""
-    inputs = {"input": input_text}
-    memory_values = conversation.memory.load_memory_variables(inputs)
-    messages = conversation.prompt.format_messages(**inputs, **memory_values)
-    result = cancellable_chat_response(conversation.llm, messages, generation)
-    if result is not None and generation_is_current(generation):
-        conversation.memory.save_context(inputs, {"response": result})
-        return result
-    return None
+            enqueue_input(
+                with_language_instruction(user_input, language),
+                generation, language, command_text,
+            )
 
 
 def gemini_task():
     """
     Task for handling Gemini AI interactions.
     """
-    global last_response
+    global last_response, playing_heads_up, heads_up_word
 
     logging.debug("gemini task start.")
     history_file_path = "res/ece_history.json"
@@ -1355,29 +1554,42 @@ def gemini_task():
             text_prompt = "what is this?"
             response = google_api.ai_image_response(multi_model, image=image, text=text_prompt)
     logging.debug(f"init vision model and first response: {response}")
-    stt_queue.put(True)
     show_status_image('ready')
 
     while True:
         logging.debug("tts wait for gemini responese text... ...")
         queued_input = input_text_queue.get()
         input_text_queue.task_done()
-        request_generation, input_text = unpack_generation_item(queued_input)
-        if not generation_is_current(request_generation):
-            logging.info("Discarding stale prompt from generation %s", request_generation)
+        if isinstance(queued_input, InputItem):
+            generation = queued_input.generation
+            language = queued_input.language
+            input_text = queued_input.text
+            decision_text = queued_input.command_text
+        else:
+            generation = get_current_generation()
+            language = language_for_generation(generation)
+            input_text = str(queued_input)
+            decision_text = normalize_command_text(input_text)
+        if not generation_is_current(generation):
+            logging.info("Discarding stale LLM input for generation %d", generation)
             continue
         if not ai_on:
             continue
 
+        def respond(text):
+            if generation_is_current(generation):
+                enqueue_output(text, generation, language)
+            else:
+                logging.info("Discarding stale LLM output for generation %d", generation)
+
         logging.debug(f"user input from voice: {input_text}")
-        stt_queue.put(False)
         user_input = input_text
         response = ""
         if not user_input:
             logging.debug(f"no input!")
-        elif "clear history" in user_input:
+        elif "clear history" in decision_text:
             conversation.memory.clear()
-        elif "photo" in user_input or "picture" in user_input or "xpression" in user_input:
+        elif "photo" in decision_text or "picture" in decision_text or "expression" in decision_text:
             ms_start = int(time.time() * 1000)
             logging.debug(f"detect pic start!")
             image = media_api.take_photo()
@@ -1395,8 +1607,8 @@ def gemini_task():
             ms_end = int(time.time() * 1000)
             logging.debug(f"ai_response end, delay = {ms_end - ms_start}ms")
             logging.debug("picture response end: {response}")
-            queue_tts(response, request_generation)
-        elif "rock paper scissors" in user_input:
+            respond(response)
+        elif "rock paper scissors" in decision_text:
             ms_start = int(time.time() * 1000)
             logging.debug(f"play game take photo")
             human_image = media_api.take_photo()
@@ -1420,11 +1632,11 @@ def gemini_task():
                 result = RPS_TIE.get(rps_game_lang, "It's a tie!")
             else:
                 result = RPS_LOSE.get(rps_game_lang, "You lose!")
-            queue_tts(result, request_generation)
+            respond(result)
             image = Image.open(f"{RES_DIR}/logo.png")
             image_queue.put(image)
 
-        elif "what is this" in user_input or ("what" and "holding") in user_input:
+        elif "what is this" in decision_text or ("what" in decision_text and "holding" in decision_text):
             ms_start = int(time.time() * 1000)
             logging.debug(f"identify take photo")
             input_image = media_api.take_photo()
@@ -1434,9 +1646,9 @@ def gemini_task():
             logging.debug(f"shown_object is: {shown_object}")
 
             response = shown_object
-            queue_tts(response, request_generation)
+            respond(response)
 
-        elif "read this" in user_input:
+        elif "read this" in decision_text:
             ms_start = int(time.time() * 1000)
             logging.debug(f"read take photo")
             input_image = media_api.take_photo()
@@ -1446,10 +1658,9 @@ def gemini_task():
             logging.debug(f"shown_text is: {shown_text}")
 
             response = shown_text
-            queue_tts(response, request_generation)
+            respond(response)
 
-        elif ("play" in user_input and "heads up" in user_input) or \
-             ("玩" in user_input and ("猜词" in user_input or "举牌" in user_input or "抬头" in user_input)):
+        elif "play" in decision_text and "heads up" in decision_text:
             conversation.memory.clear()
             init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breath responses, figuratively. If the input contains a language other than English, for example, language A, please answer the question in language A."
             response = google_api.ai_text_response(conversation, init_input)
@@ -1468,7 +1679,7 @@ def gemini_task():
             if "no word" in heads_up_word.lower():
                 playing_heads_up = False
                 logging.debug("no word on heads up card, ending heads up sequence")
-                queue_tts("No word was provided, ending heads up sequence", request_generation)
+                respond("No word was provided, ending heads up sequence")
                 continue
 
             conversation.memory.clear()
@@ -1478,12 +1689,10 @@ def gemini_task():
                 HumanMessage(content=heads_up_prompt)
             ]
 
-            ai_acknowledgement = cancellable_chat_response(
-                multi_model, conversation_history, request_generation)
-            if ai_acknowledgement is None:
-                continue
+            response = multi_model.invoke(conversation_history)
+            ai_acknowledgement = response.content
             logging.debug(f"prompt creation response: {ai_acknowledgement}")
-            queue_tts(ai_acknowledgement, request_generation)
+            respond(ai_acknowledgement)
 
             conversation_history.append(AIMessage(content=ai_acknowledgement))
 
@@ -1492,33 +1701,37 @@ def gemini_task():
             while playing_heads_up:
                 queued_input = input_text_queue.get()
                 input_text_queue.task_done()
-                request_generation, input_text = unpack_generation_item(queued_input)
-                if not generation_is_current(request_generation):
+                if isinstance(queued_input, InputItem):
+                    generation = queued_input.generation
+                    language = queued_input.language
+                    input_text = queued_input.text
+                    decision_text = queued_input.command_text
+                else:
+                    generation = get_current_generation()
+                    language = language_for_generation(generation)
+                    input_text = str(queued_input)
+                    decision_text = normalize_command_text(input_text)
+                if not generation_is_current(generation):
                     continue
                 if not ai_on:
                     continue
 
                 logging.debug(f"user input from voice: {input_text}")
-                stt_queue.put(False)
                 user_input = input_text
 
-                if ("don't want" in user_input.lower() and "play" in user_input.lower()) or \
-                   ("do not want" in user_input.lower() and "play" in user_input.lower()) or \
-                   ("exit" in user_input.lower()) or \
-                   ("quit" in user_input.lower()) or \
-                   ("stop" in user_input.lower() and ("game" in user_input.lower() or "playing" in user_input.lower())) or \
-                   "退出" in user_input or "不玩了" in user_input or \
-                   ("停止" in user_input and "游戏" in user_input) or "结束游戏" in user_input:
+                if (("don't want" in decision_text and "play" in decision_text) or
+                    ("do not want" in decision_text and "play" in decision_text) or
+                    "exit" in decision_text or "quit" in decision_text or
+                    ("stop" in decision_text and
+                     ("game" in decision_text or "playing" in decision_text))):
                     playing_heads_up = False
-                    queue_tts("Okay, exiting the heads up game. Thanks for playing!", request_generation)
+                    respond("Okay, exiting the heads up game. Thanks for playing!")
                     logging.debug("User requested to exit heads up game")
                     continue
 
                 conversation_history.append(HumanMessage(content=user_input))
-                ai_answer = cancellable_chat_response(
-                    multi_model, conversation_history, request_generation)
-                if ai_answer is None:
-                    continue
+                response = multi_model.invoke(conversation_history)
+                ai_answer = response.content
                 logging.debug(f"ai answer: {ai_answer}")
 
                 guess_count+=1
@@ -1526,101 +1739,224 @@ def gemini_task():
                 conversation_history.append(AIMessage(content=ai_answer))
 
                 if "that's it!" in ai_answer.lower() and heads_up_word.lower() in ai_answer.lower():
-                    queue_tts(
-                        f"Congratulations! You guessed the word: {heads_up_word}, in {guess_count} guesses!",
-                        request_generation,
-                    )
+                    respond(f"Congratulations! You guessed the word: {heads_up_word}, in {guess_count} guesses!")
                     playing_heads_up = False
                 else:
-                    queue_tts(ai_answer, request_generation)
+                    respond(ai_answer)
         else:
             logging.debug("text response start!")
-            response = cancellable_ai_text_response(
-                conversation, user_input, request_generation)
-            logging.debug(f"text response end: {response}")
-            if response is not None:
-                send_response(response, request_generation)
+            response = google_api.ai_text_response(conversation, user_input)
+            logging.debug("text response end: {response}")
+            if generation_is_current(generation):
+                send_response(response, generation, language)
+            else:
+                logging.info("Discarding stale text response for generation %d", generation)
         time.sleep(0.05)
 
 
-def tts_task():
-    """
-    Synthesize and play generation-tagged audio with immediate VAD cancellation.
-    """
-    global tts_interrupt_flag, tts_active
+def decode_tts_audio(audio_content):
+    """Decode Google's LINEAR16 WAV response without treating its header as audio."""
+    samples, sample_rate = sf.read(BytesIO(audio_content), dtype="int16", always_2d=False)
+    if samples.size == 0:
+        raise RuntimeError("Google TTS returned an empty audio stream.")
+    return samples, int(sample_rate)
 
-    logging.debug("tts task start.")
-    amixer_control = os.environ.get('AMIXER_CONTROL', 'PCM')
-    os.system(f"amixer -c 0 sset '{amixer_control}' 100%")
 
-    tts_client, voice, audio_config = google_api.init_text_to_speech()
-    global voice0, cur_voice
-    voice0 = voice
-    cur_voice = voice
-    output_device = choose_output_device(echo_cancellation_enabled)
-    if output_device is not None:
-        logging.info("TTS output device: %s", sd.query_devices(output_device).get("name"))
-    logging.debug("init tts end.")
+def resample_tts_audio(samples, source_rate, target_rate):
+    """Resample synthesized speech locally to the PipeWire graph rate."""
+    if source_rate == target_rate:
+        return samples
+    from math import gcd
+    divisor = gcd(source_rate, target_rate)
+    converted = resample_poly(
+        samples.astype(np.float32),
+        target_rate // divisor,
+        source_rate // divisor,
+        axis=0,
+    )
+    return np.clip(np.rint(converted), -32768, 32767).astype(np.int16)
+
+
+def play_buffered_audio(samples, sample_rate, device, latency, blocksize, stop_requested):
+    """Play a complete in-memory buffer with low-overhead interruptible callbacks."""
+    playback_samples = samples.reshape(-1, 1) if samples.ndim == 1 else samples
+    channels = playback_samples.shape[1]
+    finished = threading.Event()
+    # The ALSA Pulse plugin can report the PortAudio callback complete while a
+    # latency window is still queued in PipeWire. Queue silence after the final
+    # sample so closing the stream cannot discard the last spoken syllable.
+    drain_frames = max(1, int(latency * sample_rate) + max(0, blocksize))
+    state = {
+        "offset": 0,
+        "drain_frames": drain_frames,
+        "interrupted": False,
+        "statuses": [],
+    }
+
+    def audio_callback(outdata, frames, _time_info, status):
+        if status:
+            state["statuses"].append(str(status))
+        if stop_requested():
+            state["interrupted"] = True
+            outdata.fill(0)
+            raise sd.CallbackAbort
+
+        offset = state["offset"]
+        count = min(frames, len(playback_samples) - offset)
+        if count:
+            outdata[:count] = playback_samples[offset:offset + count]
+        if count < frames:
+            outdata[count:].fill(0)
+        state["offset"] = offset + count
+        if state["offset"] >= len(playback_samples):
+            state["drain_frames"] -= frames - count
+            if state["drain_frames"] <= 0:
+                raise sd.CallbackStop
+
+    duration = len(playback_samples) / sample_rate
+    drain_duration = drain_frames / sample_rate
+    timeout = duration + drain_duration + max(5.0, latency * 4)
+    with sd.OutputStream(
+        samplerate=sample_rate,
+        channels=channels,
+        dtype="int16",
+        device=device,
+        blocksize=blocksize,
+        latency=latency,
+        callback=audio_callback,
+        finished_callback=finished.set,
+    ) as playback:
+        if not finished.wait(timeout):
+            playback.abort(ignore_errors=True)
+            raise RuntimeError(f"TTS playback timed out after {timeout:.1f}s")
+
+    return state["interrupted"], state["statuses"]
+
+
+def tts_task_v8():
+    """Synthesize and play complete responses with generation-safe interruption."""
+    global tts_playback_started_at, tts_playback_text
+    logging.info("Starting generation-aware TTS playback")
+    amixer_control = os.environ.get("AMIXER_CONTROL", "").strip()
+    amixer_volume = os.environ.get("AMIXER_VOLUME", "85%").strip()
+    if amixer_control:
+        try:
+            subprocess.run(
+                ["amixer", "-c", os.environ.get("AMIXER_CARD", "0"),
+                 "sset", amixer_control, amixer_volume],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            logging.warning("amixer is not installed; leaving hardware volume unchanged")
+
+    tts_client = texttospeech.TextToSpeechClient()
+    playback_sample_rate = int(os.environ.get("TTS_PLAYBACK_SAMPLE_RATE_HZ", "48000"))
+    playback_latency = float(os.environ.get("TTS_LATENCY_SECONDS", "0.08"))
+    playback_blocksize = int(os.environ.get("TTS_BLOCKSIZE_FRAMES", "1024"))
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+    )
+    output_device = select_sounddevice_output(audio_routing.enabled)
+    logging.info(
+        "TTS output device=%s through PULSE_SINK=%s, playback-rate=%dHz, "
+        "latency=%.0fms, blocksize=%d",
+        output_device if output_device is not None else "system default",
+        os.environ.get("PULSE_SINK", "system default"),
+        playback_sample_rate,
+        playback_latency * 1000,
+        playback_blocksize,
+    )
+
     while True:
-        logging.debug("tts wait for Gemini response text... ...")
         queued_output = output_text_queue.get()
         output_text_queue.task_done()
-        generation, out_text = unpack_generation_item(queued_output)
-        if not generation_is_current(generation):
-            logging.info("Discarding stale queued audio from generation %s", generation)
-            continue
-        out_text = remove_asterisk_text(remove_emojis(out_text))
-        if not out_text or not ai_on:
+        if isinstance(queued_output, OutputItem):
+            item = queued_output
+        else:
+            generation = get_current_generation()
+            item = OutputItem(generation, str(queued_output), language_for_generation(generation))
+        if not generation_is_current(item.generation) or not ai_on:
+            logging.info("Discarding stale/disabled TTS output for generation %d", item.generation)
             continue
 
+        text = remove_asterisk_text(remove_emojis(item.text)).strip()
+        if not text:
+            continue
         tts_interrupt_flag.clear()
-        tts_active = True
-        interrupted = False
         try:
-            synthesis_input = texttospeech.SynthesisInput(text=out_text)
+            synthesis_started = time.monotonic()
             response = tts_client.synthesize_speech(
-                input=synthesis_input,
-                voice=cur_voice,
+                input=texttospeech.SynthesisInput(text=text),
+                voice=item.language.voice,
                 audio_config=audio_config,
             )
+            synthesis_elapsed = time.monotonic() - synthesis_started
+            samples, native_sample_rate = decode_tts_audio(response.audio_content)
+            resample_started = time.monotonic()
+            samples = resample_tts_audio(
+                samples, native_sample_rate, playback_sample_rate,
+            )
+            resample_elapsed = time.monotonic() - resample_started
+            sample_rate = playback_sample_rate
+            logging.info(
+                "TTS prepared %d characters: cloud=%.2fs, native=%dHz, "
+                "local-resample=%.3fs, playback=%dHz",
+                len(text), synthesis_elapsed, native_sample_rate,
+                resample_elapsed, sample_rate,
+            )
+        except Exception:
+            logging.exception("TTS synthesis failed for language %s", item.language.name)
+            continue
 
-            # A barge-in may arrive while the cloud TTS call is outstanding.
-            # Never let that completed-but-stale request start playback.
-            if not generation_is_current(generation) or tts_interrupt_flag.is_set():
-                interrupted = True
-                continue
+        if not generation_is_current(item.generation) or tts_interrupt_flag.is_set():
+            logging.info("Discarding synthesized audio invalidated during cloud TTS")
+            continue
 
-            try:
-                audio_data, sample_rate = sf.read(
-                    BytesIO(response.audio_content), dtype="int16", always_2d=False)
-            except Exception:
-                audio_data = np.frombuffer(response.audio_content, dtype=np.int16)
-                sample_rate = 24000
-
-            sd.play(audio_data, sample_rate, device=output_device, blocking=False)
-            while True:
-                if not generation_is_current(generation) or tts_interrupt_flag.is_set():
-                    interrupted = True
-                    sd.stop()
-                    break
-                try:
-                    if not sd.get_stream().active:
-                        break
-                except Exception:
-                    break
-                time.sleep(0.02)
-        except Exception as exc:
-            logging.error("TTS synthesis/playback error: %s", exc)
+        interrupted = False
+        playback_failed = False
+        tts_playback_text = text
+        tts_playback_started_at = time.monotonic()
+        tts_active_event.set()
+        logging.info(
+            "Speaking generation=%d language=%s duration=%.2fs",
+            item.generation, item.language.name, len(samples) / sample_rate,
+        )
+        try:
+            interrupted, callback_statuses = play_buffered_audio(
+                samples,
+                sample_rate,
+                output_device,
+                playback_latency,
+                playback_blocksize,
+                tts_interrupt_flag.is_set,
+            )
+            interrupted = interrupted or not generation_is_current(item.generation)
+            if callback_statuses:
+                logging.warning(
+                    "PortAudio reported during TTS playback: %s",
+                    ", ".join(dict.fromkeys(callback_statuses)),
+                )
+        except Exception:
+            playback_failed = True
+            logging.exception("TTS playback failed")
         finally:
-            tts_active = False
-            if interrupted:
-                logging.info("TTS generation %s interrupted by VAD", generation)
-            tts_interrupt_flag.clear()
+            tts_active_event.clear()
+            tts_playback_started_at = 0.0
+            tts_playback_text = ""
 
-        if (not interrupted and generation_is_current(generation)
-                and out_text in ({GAME_TEXT} | set(GAME_TEXTS.values()))):
-            text = "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? Only in one word, no punctuation and all in lowercase."
-            queue_llm(text, generation)
+        if interrupted:
+            logging.info("TTS generation %d interrupted by human speech", item.generation)
+            continue
+        if playback_failed:
+            continue
+        logging.info("TTS generation %d playback completed", item.generation)
+
+        if item.text in ({GAME_TEXT} | set(GAME_TEXTS.values())) and generation_is_current(item.generation):
+            enqueue_input(
+                "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? "
+                "Only in one word, no punctuation and all in lowercase.",
+                item.generation, item.language,
+            )
 
 
 def gif_task():
@@ -1679,8 +2015,7 @@ def heads_up_task():
 
 
 def main():
-    global VAD_THRESH, MIN_SPEECH_MS, MIN_SILENCE_MS, echo_cancellation_enabled
-
+    global audio_routing
     # Setup logging
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(funcName)s:%(lineno)d] - %(message)s',
@@ -1693,10 +2028,18 @@ def main():
 
     from dotenv import load_dotenv
     load_dotenv(dotenv_path='./.env')
-    VAD_THRESH = float(os.environ.get("VAD_THRESH", "0.6"))
-    MIN_SPEECH_MS = int(os.environ.get("MIN_SPEECH_MS", "500"))
-    MIN_SILENCE_MS = int(os.environ.get("MIN_SILENCE_MS", "1200"))
-    echo_cancellation_enabled = configure_echo_cancellation()
+    audio_routing = WebRTCAudioRouting()
+    try:
+        audio_routing.setup()
+    except RuntimeError as exc:
+        raise SystemExit(audio_setup_error_message(exc)) from exc
+    atexit.register(audio_routing.close)
+    try:
+        validate_portaudio_routing(audio_routing.enabled)
+    except Exception as exc:
+        audio_routing.close()
+        raise SystemExit(audio_setup_error_message(exc)) from exc
+
     api_path = os.environ.get('API_KEY_PATH', '')
     logging.debug(f"api key path: {api_path}")
     if os.path.exists(api_path):
@@ -1709,29 +2052,24 @@ def main():
     lang_code = os.environ.get('LANGUAGE_CODE', 'en-US')
     lang_name = os.environ.get('LANGUAGE_NAME', 'en-US-Standard-E')
     google_api.set_language(lang_code, lang_name)
+    configure_default_language(lang_code, lang_name)
 
     logging.info("="*60)
-    logging.info("AI APP 8 - VAD-BASED BARGE-IN")
-    logging.info("  - VAD threshold: %.2f", VAD_THRESH)
-    logging.info("  - Minimum speech: %sms", MIN_SPEECH_MS)
-    logging.info("  - End-of-turn silence: %sms", MIN_SILENCE_MS)
-    logging.info("  - Echo cancellation: %s", "enabled" if echo_cancellation_enabled else "fallback")
-    logging.info("  - Speech-start cancels LLM/TTS and invalidates queued audio")
-    logging.info("Enhanced with visual status indicators:")
-    logging.info("  🟡 Yellow: Calibrating noise profile")
-    logging.info("  🔴 Red: Actively listening to speech")
-    logging.info("  🟢 Green: Speech processing completed")
-    logging.info("  ⚪ White: Ready for next command")
-    logging.info("Optimized for noisy environments:")
-    logging.info("  - TV noise, dog barking, people talking")
-    logging.info("  - Lawn mowers, traffic, background music")
-    logging.info("Auto foreign language TTS:")
-    logging.info("  - Detects language of incoming speech via Google STT")
-    logging.info("  - Switches TTS voice to match detected foreign language")
-    logging.info("Uses: continuous WebRTC VAD + streaming Chirp 3 + generation-based cancellation")
+    logging.info("AI APP 8 - FULL-DUPLEX MULTILINGUAL BARGE-IN")
+    logging.info("Audio: %s", "verified WebRTC AEC/NS" if audio_routing.enabled else "safe half-duplex fallback")
+    logging.info(
+        "Barge-in: local WebRTC VAD with %sms confirmation after a %sms AEC guard; "
+        "cancellation=%s",
+        os.environ.get("BARGE_IN_CONFIRM_MS", "160"),
+        os.environ.get("BARGE_IN_GUARD_MS", "100"),
+        "immediate" if env_flag("BARGE_IN_CANCEL_ON_VAD", False) else "after STT validation",
+    )
+    logging.info("STT: Google Chirp 3 streaming with language identification")
+    logging.info("Commands: Cloud Translation to English before deterministic action matching")
+    logging.info("TTS: generation-aware 20ms playback chunks routed to the AEC reference sink")
     logging.info("="*60)
 
-    stt_thread = threading.Thread(target=stt_task)
+    stt_thread = threading.Thread(target=stt_task_v8, name="stt-v8")
     stt_thread.start()
     logging.debug("stt thread start.")
 
@@ -1739,7 +2077,7 @@ def main():
     gemini_thread.start()
     logging.debug("gemini thread start.")
 
-    tts_thread = threading.Thread(target=tts_task)
+    tts_thread = threading.Thread(target=tts_task_v8, name="tts-v8")
     tts_thread.start()
 
     gif_thread = threading.Thread(target=gif_task)
