@@ -44,6 +44,20 @@ Clone this repo and install the system dependencies. Full-duplex barge-in on
 Ubuntu 24.04 uses PipeWire's PulseAudio compatibility layer, the ALSA Pulse
 plugin, and a logged-in user audio session.
 
+For an automated installation, provide the downloaded Google Cloud service
+account JSON to `update_os.sh`. Run the script as the normal audio user; it asks
+for `sudo` only when installing OS packages. It validates and copies the key to
+`.credentials/google-cloud.json`, restricts it to the current user, and updates
+`.env` automatically.
+
+```bash
+cd ~/apps-md-robots
+chmod +x update_os.sh
+./update_os.sh --credential ~/Downloads/google-cloud-key.json
+```
+
+The equivalent manual installation follows.
+
 ```bash
 cd ~
 git clone -b physicalAI https://github.com/mangdangroboticsclub/apps-md-robots
@@ -78,7 +92,7 @@ Start and verify the per-user audio services. Run these commands as the normal
 logged-in desktop/audio user, without `sudo`:
 
 ```bash
-systemctl --user enable --now pipewire.service pipewire-pulse.service wireplumber.service
+systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service
 systemctl --user --no-pager status pipewire.service pipewire-pulse.service wireplumber.service
 pactl info
 ```
@@ -103,14 +117,15 @@ sudo loginctl enable-linger "$USER"
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
 ```
 
-Set your Google Cloud credentials in `.env`, then start the app.
+For a manual setup, copy the Google Cloud credential into a private directory
+and create `.env` with its absolute path:
  
 ```bash
-cp env.example .env
-
-# Edit .env and set the JSON credential path, for example:
-# API_KEY_PATH=/home/ubuntu/credentials.json
-vim .env
+install -d -m 700 .credentials
+install -m 600 ~/Downloads/google-cloud-key.json .credentials/google-cloud.json
+cp env.sample .env
+sed -i "s|^API_KEY_PATH=.*|API_KEY_PATH=$PWD/.credentials/google-cloud.json|" .env
+chmod 600 .env
 ```
 
 ## Run

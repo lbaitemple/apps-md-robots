@@ -10,7 +10,7 @@ Installs the Ubuntu and Python dependencies, configures PipeWire audio, and
 copies a Google Cloud service-account credential into the project.
 
 Run this script as the normal audio user, not with sudo. The script uses sudo
-only for apt and loginctl operations.
+only to install Ubuntu packages.
 EOF
 }
 
@@ -95,6 +95,10 @@ if [[ ${credential_source} != ${credential_target} ]]; then
     install -m 600 -- "${credential_source}" "${credential_target}"
 else
     chmod 600 -- "${credential_target}"
+fi
+
+if [[ ! -f ${env_file} && -f ${script_dir}/env.sample ]]; then
+    install -m 600 -- "${script_dir}/env.sample" "${env_file}"
 fi
 
 env_tmp=$(mktemp "${script_dir}/.env.tmp.XXXXXX")
