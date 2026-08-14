@@ -40,16 +40,18 @@ For the video guide, please click the picture and refer to the demo video.
 [![Installation Guide](https://img.youtube.com/vi/1AkhJi2o8rM/0.jpg)](https://www.youtube.com/watch?v=1AkhJi2o8rM)
 
 
-Clone this repo, and install denpendency libs.
+Clone this repo, and install the dependencies. Full-duplex barge-in on Ubuntu
+24.04 uses PipeWire's PulseAudio compatibility layer and the ALSA Pulse plugin.
 ```
 cd ~
 git clone https://github.com/mangdangroboticsclub/apps-md-robots
 cd apps-md-robots
-sudo apt-get install -y python3-pyaudio
+sudo apt-get update
+sudo apt-get install -y python3-pyaudio pipewire pipewire-pulse wireplumber \
+    libspa-0.2-modules pulseaudio-utils libasound2-plugins
 sudo pip install -r requirements.txt
 
 ```
-
 
 Set your google cloud API key in env.example file and then start.
  
@@ -70,4 +72,3 @@ run app demos, eg. ai_apps
 cd ai_apps/
 python ai_app.py
 ```
-
