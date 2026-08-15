@@ -70,8 +70,36 @@ RPS_TIE  = {"Chinese": "平局！",   "Japanese": "引き分けです！",    "K
             "Spanish": "¡Empate!", "French": "Égalité !",          "German": "Unentschieden!"}
 RPS_LOSE = {"Chinese": "你输了！", "Japanese": "あなたの負けです！","Korean": "당신이 졌습니다！",
             "Spanish": "¡Perdiste!", "French": "Vous avez perdu !", "German": "Du hast verloren!"}
+RPS_WIN_CONDITIONS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
+RPS_GESTURES = ("rock", "paper", "scissors")
 
 rps_game_lang = None  # language name of the current/last RPS game
+rps_round_pending = False  # True once "Shoot!" has been requested, until a move is scored
+
+
+def get_rps_voice_move(command_text):
+    """Return the single spoken rock/paper/scissors move, or None.
+
+    A bare move ("play rock") answers a pending round. A phrase naming more
+    than one gesture ("rock paper scissors") is a request to start a game,
+    not a move, so it is left for the game-start branch to handle.
+    """
+    matches = [word for word in RPS_GESTURES if word in command_text]
+    return matches[0] if len(matches) == 1 else None
+
+
+def score_rps_voice_move(voice_move):
+    """Score a spoken move against a random robot gesture and return the result text."""
+    puppy_gesture = random.choice(RPS_GESTURES)
+    if RPS_WIN_CONDITIONS.get(voice_move) == puppy_gesture:
+        result = RPS_WIN.get(rps_game_lang, "You win!")
+    elif voice_move == puppy_gesture:
+        result = RPS_TIE.get(rps_game_lang, "It's a tie!")
+    else:
+        result = RPS_LOSE.get(rps_game_lang, "You lose!")
+    puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
+    image_queue.put(puppy_image)
+    return result
 ai_on = True
 
 # A generation changes as soon as local VAD confirms a new human utterance.
@@ -1417,7 +1445,7 @@ def remove_asterisk_text(text):
 
 def stt_task_v8():
     """Continuously listen to the AEC/NS source, including while TTS plays."""
-    global cur_voice, rps_game_lang
+    global cur_voice, rps_game_lang, rps_round_pending
 
     logging.info("Starting full-duplex WebRTC AEC/NS -> VAD -> streaming STT front end")
     py_audio = google_api.init_pyaudio()
@@ -1535,9 +1563,15 @@ def stt_task_v8():
               "exit" in command_text or "quit" in command_text or
               ("stop" in command_text and
                ("game" in command_text or "playing" in command_text))):
+            rps_round_pending = False
             enqueue_input(user_input, generation, language, command_text)
+        elif rps_round_pending and (voice_move := get_rps_voice_move(command_text)):
+            rps_round_pending = False
+            result = score_rps_voice_move(voice_move)
+            enqueue_output(result, generation, language)
         elif (any(word in command_text for word in ("rock", "paper", "scissors")) or
               ("game" in command_text and "play" in command_text)):
+            rps_round_pending = True
             rps_game_lang = language.name
             enqueue_output(GAME_TEXTS.get(rps_game_lang, GAME_TEXT), generation, language)
         elif requested_name and last_response and any(
@@ -1561,7 +1595,7 @@ def gemini_task():
     """
     Task for handling Gemini AI interactions.
     """
-    global last_response, playing_heads_up, heads_up_word
+    global last_response, playing_heads_up, heads_up_word, rps_round_pending
 
     logging.debug("gemini task start.")
     history_file_path = "res/ece_history.json"
@@ -1645,9 +1679,8 @@ def gemini_task():
             human_image = media_api.take_photo()
             logging.debug(f"play game take photo finish")
 
-            gestures = ["rock", "paper", "scissors"]
             random.seed(int(time.time()))
-            puppy_gesture = random.choice(gestures)
+            puppy_gesture = random.choice(RPS_GESTURES)
             logging.debug(f"puppy_gesture is: {puppy_gesture}")
             puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
             image_queue.put(puppy_image)
@@ -1656,8 +1689,8 @@ def gemini_task():
             human_gesture = human_gesture.replace(' ', '')
             logging.debug(f"human_gesture is: {human_gesture}")
 
-            win_conditions = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
-            if win_conditions.get(human_gesture) == puppy_gesture:
+            rps_round_pending = False
+            if RPS_WIN_CONDITIONS.get(human_gesture) == puppy_gesture:
                 result = RPS_WIN.get(rps_game_lang, "You win!")
             elif human_gesture == puppy_gesture:
                 result = RPS_TIE.get(rps_game_lang, "It's a tie!")
