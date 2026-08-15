@@ -647,7 +647,7 @@ def show_status_image(status):
     When AI is off, keeps the logo2.png image displayed.
 
     Args:
-        status: 'calibrating', 'listening', 'completed', or 'ready'
+        status: 'calibrating', 'listening', 'completed', 'thinking', 'talking', or 'ready' (hello_ready.png)
     """
     global ai_on
 
@@ -669,10 +669,18 @@ def show_status_image(status):
             image = Image.open(f"{RES_DIR}/hello_g.png")  # Green for completed
             image_queue.put(image)
             logging.info("🟢 Displaying completion status (hello_g.png)")
-        elif status == 'ready':
-            image = Image.open(f"{RES_DIR}/hello.png")    # Default ready state
+        elif status == 'thinking':
+            image = Image.open(f"{RES_DIR}/hello_think.png")  # Generating a response
             image_queue.put(image)
-            logging.info("⚪ Displaying ready status (hello.png)")
+            logging.info("💭 Displaying thinking status (hello_think.png)")
+        elif status == 'talking':
+            image = Image.open(f"{RES_DIR}/hello_talk.png")  # Robot is speaking
+            image_queue.put(image)
+            logging.info("🗣️ Displaying talking status (hello_talk.png)")
+        elif status == 'ready':
+            image = Image.open(f"{RES_DIR}/hello_ready.png")  # Ready to accept voice input
+            image_queue.put(image)
+            logging.info("⚪ Displaying ready status (hello_ready.png)")
     except Exception as e:
         logging.error(f"Failed to display status image for '{status}': {e}")
 
@@ -1597,6 +1605,8 @@ def gemini_task():
         if not ai_on:
             continue
 
+        show_status_image("thinking")
+
         def respond(text):
             if generation_is_current(generation):
                 enqueue_output(text, generation, language)
@@ -1736,6 +1746,8 @@ def gemini_task():
                     continue
                 if not ai_on:
                     continue
+
+                show_status_image("thinking")
 
                 logging.debug(f"user input from voice: {input_text}")
                 user_input = input_text
@@ -1938,6 +1950,7 @@ def tts_task_v8():
         tts_playback_text = text
         tts_playback_started_at = time.monotonic()
         tts_active_event.set()
+        show_status_image("talking")
         logging.info(
             "Speaking generation=%d language=%s duration=%.2fs",
             item.generation, item.language.name, len(samples) / sample_rate,
@@ -1964,6 +1977,7 @@ def tts_task_v8():
             tts_active_event.clear()
             tts_playback_started_at = 0.0
             tts_playback_text = ""
+            show_status_image("ready")
 
         if interrupted:
             logging.info("TTS generation %d interrupted by human speech", item.generation)
