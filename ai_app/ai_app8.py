@@ -24,6 +24,7 @@ import os
 import time
 import re
 import atexit
+import signal
 import subprocess
 import numpy as np
 from scipy.signal import resample_poly
@@ -102,8 +103,9 @@ def score_rps_voice_move(voice_move):
     return result
 ai_on = True
 
-# A generation changes as soon as local VAD confirms a new human utterance.
-# Anything produced for an older generation is stale and must not be spoken.
+# A generation changes only after STT confirms a non-empty human utterance.
+# Local VAD is deliberately provisional: a knock or other noise must not make
+# pending LLM/TTS work stale before any actual words have been recognized.
 generation_lock = threading.Lock()
 current_generation = 0
 tts_interrupt_flag = threading.Event()
@@ -178,6 +180,11 @@ heads_up_questions = 0
 # Track last response for translation
 last_response = ""
 
+# The STT, LLM, and TTS threads share one display state. Transitions are
+# serialized so completion from older work cannot overwrite a newer state.
+status_image_lock = threading.Lock()
+current_status_image = None
+
 
 def env_flag(name, default=False):
     """Read a conventional boolean environment variable."""
@@ -207,6 +214,7 @@ class OutputItem:
     generation: int
     text: str
     language: LanguageChoice
+    must_finish: bool = False
 
 
 DEFAULT_LANGUAGE = LanguageChoice("English", "en-US", voice0)
@@ -298,12 +306,12 @@ def enqueue_input(text, generation=None, language=None, command_text=None):
     input_text_queue.put(InputItem(generation, text, language, command_text))
 
 
-def enqueue_output(text, generation=None, language=None):
+def enqueue_output(text, generation=None, language=None, must_finish=False):
     if not text:
         return
     generation = get_current_generation() if generation is None else generation
     language = language or language_for_generation(generation)
-    output_text_queue.put(OutputItem(generation, str(text), language))
+    output_text_queue.put(OutputItem(generation, str(text), language, must_finish))
 
 
 class WebRTCAudioRouting:
@@ -668,7 +676,7 @@ class ChirpStreamingSession:
         return self.transcript or None, self.language_code
 
 
-def show_status_image(status):
+def show_status_image(status, expected_statuses=None):
     """
     Display status images for different speech recognition stages.
     Only displays images when AI is active (ai_on=True).
@@ -677,7 +685,7 @@ def show_status_image(status):
     Args:
         status: 'calibrating', 'listening', 'completed', 'thinking', 'talking', or 'ready' (hello_ready.png)
     """
-    global ai_on
+    global ai_on, current_status_image
 
     # Don't change image when AI is off (close_ai mode)
     if not ai_on:
@@ -685,32 +693,59 @@ def show_status_image(status):
         return
 
     try:
-        if status == 'calibrating':
-            image = Image.open(f"{RES_DIR}/hello_y.png")  # Yellow for calibration
+        status_files = {
+            "calibrating": "hello_y.png",
+            "listening": "hello_r.png",
+            "completed": "hello_g.png",
+            "thinking": "hello_think.png",
+            "talking": "hello_talk.png",
+            "ready": "hello_ready.png",
+        }
+        filename = status_files.get(status)
+        if not filename:
+            logging.warning("Unknown display status %r", status)
+            return False
+
+        with status_image_lock:
+            if (expected_statuses is not None and
+                    current_status_image not in expected_statuses):
+                logging.debug(
+                    "Ignoring stale display transition %s -> %s",
+                    current_status_image, status,
+                )
+                return False
+            if current_status_image == status:
+                return True
+            image = Image.open(f"{RES_DIR}/{filename}")
             image_queue.put(image)
-            logging.info("🟡 Displaying calibration status (hello_y.png)")
-        elif status == 'listening':
-            image = Image.open(f"{RES_DIR}/hello_r.png")  # Red for active listening
-            image_queue.put(image)
-            logging.info("🔴 Displaying listening status (hello_r.png)")
-        elif status == 'completed':
-            image = Image.open(f"{RES_DIR}/hello_g.png")  # Green for completed
-            image_queue.put(image)
-            logging.info("🟢 Displaying completion status (hello_g.png)")
-        elif status == 'thinking':
-            image = Image.open(f"{RES_DIR}/hello_think.png")  # Generating a response
-            image_queue.put(image)
-            logging.info("💭 Displaying thinking status (hello_think.png)")
-        elif status == 'talking':
-            image = Image.open(f"{RES_DIR}/hello_talk.png")  # Robot is speaking
-            image_queue.put(image)
-            logging.info("🗣️ Displaying talking status (hello_talk.png)")
-        elif status == 'ready':
-            image = Image.open(f"{RES_DIR}/hello_ready.png")  # Ready to accept voice input
-            image_queue.put(image)
-            logging.info("⚪ Displaying ready status (hello_ready.png)")
+            current_status_image = status
+        logging.info("Display state=%s (%s)", status, filename)
+        return True
     except Exception as e:
         logging.error(f"Failed to display status image for '{status}': {e}")
+        return False
+
+
+class NoiseFloorTracker:
+    """Adaptive estimate of the ambient background-noise RMS.
+
+    Fed only non-speech frames captured while TTS is silent, so a noisy room
+    raises the floor and a quiet one lowers it, instead of callers comparing
+    against one fixed RMS constant that is wrong as soon as the room isn't.
+    The rise is faster than the fall so a burst of noise (a door, a fan
+    kicking on) is tracked quickly, while a brief lull right after loud
+    noise doesn't undershoot the floor and make the next quiet moment look
+    like speech.
+    """
+
+    def __init__(self, initial_rms, rise_alpha, fall_alpha):
+        self.floor = float(initial_rms)
+        self.rise_alpha = rise_alpha
+        self.fall_alpha = fall_alpha
+
+    def update(self, rms):
+        alpha = self.rise_alpha if rms > self.floor else self.fall_alpha
+        self.floor += alpha * (rms - self.floor)
 
 
 class NoiseRobustSTT:
@@ -769,11 +804,24 @@ class NoiseRobustSTT:
         pre_roll_ms = int(os.environ.get("PRE_ROLL_MS", "400"))
         self.ring_buffer_size = max(10, pre_roll_ms // self.vad_frame_duration_ms)
 
+        # Adaptive background-noise floor. barge_in_min_rms/silence_threshold
+        # above remain hard minimums; the effective gate is whichever is
+        # higher of that minimum and (tracked ambient noise + margin), so a
+        # noisy room stops false-triggering barge-in and a quiet room still
+        # catches soft speech near the old fixed floor.
+        self.noise_floor = NoiseFloorTracker(
+            initial_rms=float(os.environ.get("NOISE_FLOOR_INITIAL_RMS", "150")),
+            rise_alpha=float(os.environ.get("NOISE_FLOOR_RISE_ALPHA", "0.1")),
+            fall_alpha=float(os.environ.get("NOISE_FLOOR_FALL_ALPHA", "0.02")),
+        )
+        self.barge_in_margin_rms = max(0, int(os.environ.get("BARGE_IN_MARGIN_RMS", "150")))
+
         logging.info(
             "STT front end initialized: WebRTC VAD=%d, pre-roll=%dms, "
             "speech confirmation=%dms, barge confirmation=%dms, "
             "barge guard=%dms, max barge gap=%dms, cancel-on-VAD=%s, "
-            "barge min RMS=%d, end silence=%dms",
+            "barge min RMS=%d (+adaptive margin=%d over tracked noise floor, "
+            "starting at %.0f), end silence=%dms",
             vad_aggressiveness, self.ring_buffer_size * 20,
             self.num_speech_frames_threshold * 20,
             self.num_barge_in_frames_threshold * 20,
@@ -781,6 +829,8 @@ class NoiseRobustSTT:
             self.barge_in_max_gap_frames * 20,
             self.cancel_barge_in_on_vad,
             self.barge_in_min_rms,
+            self.barge_in_margin_rms,
+            self.noise_floor.floor,
             self.num_silent_frames_threshold * 20,
         )
 
@@ -815,10 +865,13 @@ class NoiseRobustSTT:
             return self.vad.is_speech(resampled.tobytes(), self._VAD_RATE)
 
         except Exception as e:
-            # Amplitude fallback — use a fixed low threshold so normal speech is detected
+            # Amplitude fallback — gate against whichever is higher of the
+            # configured floor and the adaptively tracked ambient noise, so a
+            # noisy room doesn't get stuck permanently "hearing" speech.
+            adaptive_threshold = max(self.silence_threshold, self.noise_floor.floor * 1.5)
             rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
-            result = rms >= self.silence_threshold
-            logging.warning(f"VAD exception ({e}), amplitude fallback: RMS={rms:.0f} threshold={self.silence_threshold:.0f} speech={result}")
+            result = rms >= adaptive_threshold
+            logging.warning(f"VAD exception ({e}), amplitude fallback: RMS={rms:.0f} threshold={adaptive_threshold:.0f} speech={result}")
             return result
 
     def transcribe_audio(self, audio_bytes):
@@ -889,8 +942,9 @@ class NoiseRobustSTT:
         """Capture one cleaned utterance and stream it to multilingual STT.
 
         Returns ``(transcript, language_code, generation, was_barge_in)``.  The
-        generation is allocated at VAD confirmation, before cloud STT returns,
-        so playback stops without a network round trip.
+        current generation is snapshotted at VAD confirmation, but a new one
+        is allocated only after cloud STT confirms actual human speech.  This
+        prevents noise-only VAD events from invalidating pending responses.
         """
         frame_ms = self.vad_frame_duration_ms
         pre_roll = deque(maxlen=self.ring_buffer_size)
@@ -901,6 +955,7 @@ class NoiseRobustSTT:
         silent_frames = 0
         generation = None
         was_barge_in = False
+        deferred_barge_in_validation = False
         candidate_during_tts = False
         barge_in_reference = ""
         candidate_peak_rms = 0.0
@@ -950,10 +1005,22 @@ class NoiseRobustSTT:
             audio_data = np.frombuffer(data, dtype=np.int16)
             audio_rms = float(np.sqrt(np.mean(audio_data.astype(np.float32) ** 2)))
             is_speech = self.is_speech_vad(audio_data)
-            if tts_is_active and audio_rms < self.barge_in_min_rms:
+
+            # Track ambient noise only from confirmed-quiet frames while TTS
+            # is silent, so playback residual and the utterance itself never
+            # feed the estimate. barge_in_min_rms stays a hard floor beneath
+            # the adaptive gate so a near-silent room can't drive it to ~0.
+            if not tts_is_active and not is_speech:
+                self.noise_floor.update(audio_rms)
+            effective_barge_in_min_rms = max(
+                self.barge_in_min_rms,
+                self.noise_floor.floor + self.barge_in_margin_rms,
+            )
+            if tts_is_active and audio_rms < effective_barge_in_min_rms:
                 # WebRTC VAD can label faint residual far-end speech as voice.
-                # Require near-end energy as well before allowing local TTS
-                # cancellation; normal listening remains VAD-only.
+                # Require near-end energy above the adaptive noise floor as
+                # well before allowing local TTS cancellation; normal
+                # listening remains VAD-only.
                 is_speech = False
 
             if state in {"IDLE", "BARGE_CANDIDATE"}:
@@ -989,23 +1056,45 @@ class NoiseRobustSTT:
                     continue
 
                 was_barge_in = candidate_during_tts
-                if was_barge_in and not self.cancel_barge_in_on_vad:
-                    generation = get_current_generation()
+                deferred_barge_in_validation = was_barge_in and not self.cancel_barge_in_on_vad
+                # VAD is only a candidate signal.  Keep the current generation
+                # until STT returns real text, otherwise a knock can invalidate
+                # an LLM response that has not reached TTS yet.
+                generation = get_current_generation()
+                if deferred_barge_in_validation:
                     barge_in_reference = tts_playback_text
                     logging.info(
                         "Barge-in candidate buffered; waiting for STT validation "
                         "before cancelling generation %d",
                         generation,
                     )
+                elif was_barge_in:
+                    # Optional low-latency mode may stop active audio on VAD,
+                    # but it still must not invalidate queued work until STT
+                    # verifies that the event contained words.
+                    stop_tts_playback()
+                    barge_in_reference = tts_playback_text
+                    logging.info(
+                        "Immediate local barge-in playback stop requested "
+                        "(peak RMS=%.0f, threshold=%d); generation remains "
+                        "provisional until STT validation",
+                        candidate_peak_rms,
+                        self.barge_in_min_rms,
+                    )
                 else:
-                    generation = begin_human_turn()
-                    if was_barge_in:
-                        logging.info(
-                            "Immediate local barge-in accepted (peak RMS=%.0f, threshold=%d)",
-                            candidate_peak_rms,
-                            self.barge_in_min_rms,
-                        )
+                    logging.info(
+                        "Speech candidate buffered for generation %d; waiting "
+                        "for STT validation before invalidating pending output",
+                        generation,
+                    )
                 state = "LISTENING"
+                # Show the listening indicator as soon as local VAD confirms
+                # a candidate, even for a deferred barge-in that cloud STT
+                # hasn't validated yet. Waiting for that round trip means the
+                # indicator would lag or never show for genuine barge-ins
+                # that go straight from talking -> completed -> thinking; the
+                # RMS/gap gating above already keeps pure TTS echo from
+                # reaching this point in the first place.
                 show_status_image("listening")
                 captured = list(pre_roll)
                 voiced_frames = speech_frames
@@ -1037,7 +1126,10 @@ class NoiseRobustSTT:
             if not speech_finished and not length_limit:
                 continue
 
-            show_status_image("completed")
+            # A deferred barge-in candidate leaves the display at "talking"
+            # (or "ready", if TTS finished naturally mid-capture) instead of
+            # "listening", so all three are valid predecessors here.
+            show_status_image("completed", expected_statuses={"listening", "talking", "ready"})
             if voiced_frames < min_speech_frames:
                 logging.info("Ignoring %dms VAD event as too short", voiced_frames * frame_ms)
                 if streaming:
@@ -1045,7 +1137,7 @@ class NoiseRobustSTT:
                         streaming.finish()
                     except Exception:
                         pass
-                show_status_image("ready")
+                show_status_image("ready", expected_statuses={"completed"})
                 return None, None, generation, was_barge_in
 
             full_audio = b"".join(captured)
@@ -1059,30 +1151,38 @@ class NoiseRobustSTT:
             if not transcript:
                 transcript, detected_language = self.transcribe_audio(full_audio)
 
-            if was_barge_in and not self.cancel_barge_in_on_vad:
+            if was_barge_in:
                 if not transcript:
                     logging.info(
-                        "Ignoring untranscribed barge-in candidate; TTS was not interrupted"
+                        "Ignoring untranscribed barge-in candidate; generation "
+                        "was not changed"
                     )
-                    show_status_image("ready")
+                    show_status_image("ready", expected_statuses={"completed"})
                     return None, None, generation, was_barge_in
                 if transcript_matches_tts_echo(transcript, barge_in_reference):
                     logging.info(
                         "Ignoring probable TTS echo transcript %r; TTS was not interrupted",
                         transcript,
                     )
-                    show_status_image("ready")
+                    show_status_image("ready", expected_statuses={"completed"})
                     return None, None, generation, was_barge_in
+
+            if transcript:
                 if not generation_is_current(generation):
                     logging.info(
-                        "Discarding barge-in candidate for stale generation %d", generation
+                        "Discarding speech candidate for stale generation %d", generation
                     )
-                    show_status_image("ready")
+                    show_status_image("ready", expected_statuses={"completed"})
                     return None, None, generation, was_barge_in
                 generation = begin_human_turn()
-                logging.info("Validated human barge-in transcript before cancelling TTS")
+                logging.info(
+                    "Validated human transcript before invalidating pending output"
+                )
 
-            show_status_image("ready")
+            if transcript:
+                show_status_image("thinking", expected_statuses={"completed"})
+            else:
+                show_status_image("ready", expected_statuses={"completed"})
             logging.info(
                 "STT finalized generation=%s language=%s transcript=%r",
                 generation, detected_language, transcript,
@@ -1351,16 +1451,18 @@ def get_move_cmd(input_text, command_dict):
     return None
 
 def close_ai():
-    global ai_on
+    global ai_on, current_status_image
     ai_on = False
     stop_tts_playback()
     image = Image.open(f"{RES_DIR}/logo2.png")
-    image_queue.put(image)
+    with status_image_lock:
+        image_queue.put(image)
+        current_status_image = "off"
 
 def open_ai():
     global ai_on
     ai_on = True
-    show_status_image('ready')
+    show_status_image("ready")
     enqueue_output("OK, my friend.")
 
 def reboot():
@@ -1370,6 +1472,13 @@ def reboot():
 def power_off():
     command = "sudo poweroff"
     shell_api.execute_command(command)
+
+def restart_service():
+    """Restart the robot UI without ever opening an interactive sudo prompt."""
+    subprocess.run(
+        ["sudo", "-n", "/usr/bin/systemctl", "restart", "robot.service"],
+        check=True,
+    )
 
 sys_cmds_functions = {
         "shut up": close_ai,
@@ -1520,6 +1629,7 @@ def stt_task_v8():
             for phrase in interrupt_phrases
         ):
             logging.info("Barge-in stop command transcribed; remaining silent")
+            show_status_image("ready", expected_statuses={"thinking"})
             continue
 
         requested_name, requested_voice = get_voice(command_text)
@@ -1568,7 +1678,7 @@ def stt_task_v8():
         elif rps_round_pending and (voice_move := get_rps_voice_move(command_text)):
             rps_round_pending = False
             result = score_rps_voice_move(voice_move)
-            enqueue_output(result, generation, language)
+            enqueue_output(result, generation, language, must_finish=True)
         elif (any(word in command_text for word in ("rock", "paper", "scissors")) or
               ("game" in command_text and "play" in command_text)):
             rps_round_pending = True
@@ -1617,7 +1727,10 @@ def gemini_task():
             text_prompt = "what is this?"
             response = google_api.ai_image_response(multi_model, image=image, text=text_prompt)
     logging.debug(f"init vision model and first response: {response}")
-    show_status_image('ready')
+    show_status_image(
+        "ready",
+        expected_statuses={None, "calibrating", "ready"},
+    )
 
     while True:
         logging.debug("tts wait for gemini responese text... ...")
@@ -1639,11 +1752,14 @@ def gemini_task():
         if not ai_on:
             continue
 
-        show_status_image("thinking")
+        show_status_image(
+            "thinking",
+            expected_statuses={"ready", "completed", "thinking"},
+        )
 
-        def respond(text):
-            if generation_is_current(generation):
-                enqueue_output(text, generation, language)
+        def respond(text, must_finish=False):
+            if must_finish or generation_is_current(generation):
+                enqueue_output(text, generation, language, must_finish=must_finish)
             else:
                 logging.info("Discarding stale LLM output for generation %d", generation)
 
@@ -1696,7 +1812,7 @@ def gemini_task():
                 result = RPS_TIE.get(rps_game_lang, "It's a tie!")
             else:
                 result = RPS_LOSE.get(rps_game_lang, "You lose!")
-            respond(result)
+            respond(result, must_finish=True)
             image = Image.open(f"{RES_DIR}/logo.png")
             image_queue.put(image)
 
@@ -1743,7 +1859,10 @@ def gemini_task():
             if "no word" in heads_up_word.lower():
                 playing_heads_up = False
                 logging.debug("no word on heads up card, ending heads up sequence")
-                respond("No word was provided, ending heads up sequence")
+                respond(
+                    "No word was provided, ending heads up sequence",
+                    must_finish=True,
+                )
                 continue
 
             conversation.memory.clear()
@@ -1756,7 +1875,7 @@ def gemini_task():
             response = multi_model.invoke(conversation_history)
             ai_acknowledgement = response.content
             logging.debug(f"prompt creation response: {ai_acknowledgement}")
-            respond(ai_acknowledgement)
+            respond(ai_acknowledgement, must_finish=True)
 
             conversation_history.append(AIMessage(content=ai_acknowledgement))
 
@@ -1780,7 +1899,10 @@ def gemini_task():
                 if not ai_on:
                     continue
 
-                show_status_image("thinking")
+                show_status_image(
+                    "thinking",
+                    expected_statuses={"ready", "completed", "thinking"},
+                )
 
                 logging.debug(f"user input from voice: {input_text}")
                 user_input = input_text
@@ -1791,7 +1913,10 @@ def gemini_task():
                     ("stop" in decision_text and
                      ("game" in decision_text or "playing" in decision_text))):
                     playing_heads_up = False
-                    respond("Okay, exiting the heads up game. Thanks for playing!")
+                    respond(
+                        "Okay, exiting the heads up game. Thanks for playing!",
+                        must_finish=True,
+                    )
                     logging.debug("User requested to exit heads up game")
                     continue
 
@@ -1805,10 +1930,14 @@ def gemini_task():
                 conversation_history.append(AIMessage(content=ai_answer))
 
                 if "that's it!" in ai_answer.lower() and heads_up_word.lower() in ai_answer.lower():
-                    respond(f"Congratulations! You guessed the word: {heads_up_word}, in {guess_count} guesses!")
+                    respond(
+                        f"Congratulations! You guessed the word: {heads_up_word}, "
+                        f"in {guess_count} guesses!",
+                        must_finish=True,
+                    )
                     playing_heads_up = False
                 else:
-                    respond(ai_answer)
+                    respond(ai_answer, must_finish=True)
         else:
             logging.debug("text response start!")
             response = google_api.ai_text_response(conversation, user_input)
@@ -1941,12 +2070,14 @@ def tts_task_v8():
         else:
             generation = get_current_generation()
             item = OutputItem(generation, str(queued_output), language_for_generation(generation))
-        if not generation_is_current(item.generation) or not ai_on:
+        if ((not generation_is_current(item.generation) and not item.must_finish) or
+                not ai_on):
             logging.info("Discarding stale/disabled TTS output for generation %d", item.generation)
             continue
 
         text = remove_asterisk_text(remove_emojis(item.text)).strip()
         if not text:
+            show_status_image("ready", expected_statuses={"thinking"})
             continue
         tts_interrupt_flag.clear()
         try:
@@ -1972,9 +2103,11 @@ def tts_task_v8():
             )
         except Exception:
             logging.exception("TTS synthesis failed for language %s", item.language.name)
+            show_status_image("ready", expected_statuses={"thinking"})
             continue
 
-        if not generation_is_current(item.generation) or tts_interrupt_flag.is_set():
+        if (not item.must_finish and
+                (not generation_is_current(item.generation) or tts_interrupt_flag.is_set())):
             logging.info("Discarding synthesized audio invalidated during cloud TTS")
             continue
 
@@ -1983,7 +2116,10 @@ def tts_task_v8():
         tts_playback_text = text
         tts_playback_started_at = time.monotonic()
         tts_active_event.set()
-        show_status_image("talking")
+        show_status_image(
+            "talking",
+            expected_statuses={"ready", "thinking", "talking"},
+        )
         logging.info(
             "Speaking generation=%d language=%s duration=%.2fs",
             item.generation, item.language.name, len(samples) / sample_rate,
@@ -1995,9 +2131,11 @@ def tts_task_v8():
                 output_device,
                 playback_latency,
                 playback_blocksize,
-                tts_interrupt_flag.is_set,
+                (lambda: False) if item.must_finish else tts_interrupt_flag.is_set,
             )
-            interrupted = interrupted or not generation_is_current(item.generation)
+            interrupted = interrupted or (
+                not item.must_finish and not generation_is_current(item.generation)
+            )
             if callback_statuses:
                 logging.warning(
                     "PortAudio reported during TTS playback: %s",
@@ -2010,7 +2148,7 @@ def tts_task_v8():
             tts_active_event.clear()
             tts_playback_started_at = 0.0
             tts_playback_text = ""
-            show_status_image("ready")
+            show_status_image("ready", expected_statuses={"talking"})
 
         if interrupted:
             logging.info("TTS generation %d interrupted by human speech", item.generation)
@@ -2160,13 +2298,42 @@ def main():
     heads_up_thread = threading.Thread(target=heads_up_task)
     heads_up_thread.start()
 
-    stt_thread.join()
-    gemini_thread.join()
-    tts_thread.join()
-    gif_thread.join()
-    image_thread.join()
-    move_thread.join()
-    heads_up_thread.join()
+    try:
+        stt_thread.join()
+        gemini_thread.join()
+        tts_thread.join()
+        gif_thread.join()
+        image_thread.join()
+        move_thread.join()
+        heads_up_thread.join()
+    except KeyboardInterrupt:
+        # The worker threads above are non-daemon and block on queues/audio
+        # I/O, so they would otherwise keep the process alive after Ctrl-C.
+        # A second Ctrl-C while the restart is still in flight would send
+        # SIGINT to this whole foreground process group, killing the
+        # sudo/systemctl child before it finishes and leaving robot.service
+        # untouched. Ignoring SIGINT here is inherited across exec, so the
+        # child is protected too; restart_service() logs its own completion.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        logging.info(
+            "Ctrl-C received; restarting robot.service (this can take a few "
+            "seconds while the robot control process shuts down cleanly, "
+            "please don't press Ctrl-C again)"
+        )
+        try:
+            audio_routing.close()
+        except Exception:
+            logging.exception("Failed to release audio routing before restart")
+        try:
+            restart_service()
+        except (OSError, subprocess.CalledProcessError):
+            logging.exception(
+                "Could not restart robot.service without a password; "
+                "check the sudoers NOPASSWD rule for systemctl"
+            )
+            os._exit(1)
+        logging.info("robot.service restarted; exiting")
+        os._exit(0)
 
 
 if __name__ == '__main__':
