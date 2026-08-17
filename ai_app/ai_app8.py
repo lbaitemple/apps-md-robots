@@ -26,6 +26,7 @@ import re
 import atexit
 import signal
 import subprocess
+from difflib import SequenceMatcher
 import numpy as np
 from scipy.signal import resample_poly
 from PIL import Image
@@ -73,12 +74,35 @@ RPS_LOSE = {"Chinese": "你输了！", "Japanese": "あなたの負けです！"
             "Spanish": "¡Perdiste!", "French": "Vous avez perdu !", "German": "Du hast verloren!"}
 RPS_WIN_CONDITIONS = {"rock": "scissors", "scissors": "paper", "paper": "rock"}
 RPS_GESTURES = ("rock", "paper", "scissors")
+RPS_MOVE_ALIASES = {
+    "rock": {"stone", "fist", "wrong", "roc", "rack"},
+    "paper": {"cloth", "fabric", "sheet", "leaf", "pepper", "papers"},
+    "scissors": {"scissor", "shears", "sizzors"},
+}
+RPS_INVALID_MOVE = {
+    "Chinese": "请说石头、剪刀或布。",
+    "Japanese": "グー、チョキ、パーのどれかを言ってください。",
+    "Korean": "바위, 가위, 보 중 하나를 말해 주세요.",
+    "Spanish": "Di piedra, papel o tijeras.",
+    "French": "Dites pierre, feuille ou ciseaux.",
+    "German": "Sag Stein, Papier oder Schere.",
+}
+RPS_UNCLEAR_GESTURE = {
+    "Chinese": "我没有看清你的手势，请再试一次。",
+    "Japanese": "手の形が見えませんでした。もう一度試してください。",
+    "Korean": "손동작을 확인하지 못했어요. 다시 시도해 주세요.",
+    "Spanish": "No pude ver tu gesto. Inténtalo de nuevo.",
+    "French": "Je n'ai pas pu voir votre geste. Réessayez.",
+    "German": "Ich konnte deine Geste nicht erkennen. Versuch es noch einmal.",
+}
 
 rps_game_lang = None  # language name of the current/last RPS game
 rps_round_pending = False  # True once "Shoot!" has been requested, until a move is scored
+rps_countdown_active = False
+rps_gesture_display_active = False
 
 
-def get_rps_voice_move(command_text):
+def get_rps_voice_move(command_text, allow_stt_aliases=False):
     """Return the single spoken rock/paper/scissors move, or None.
 
     A bare move ("play rock") answers a pending round. A phrase naming more
@@ -86,7 +110,23 @@ def get_rps_voice_move(command_text):
     not a move, so it is left for the game-start branch to handle.
     """
     matches = [word for word in RPS_GESTURES if word in command_text]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if matches or not allow_stt_aliases:
+        return None
+
+    tokens = set(command_text.split())
+    alias_matches = [
+        gesture for gesture, aliases in RPS_MOVE_ALIASES.items()
+        if tokens.intersection(aliases)
+    ]
+    if len(alias_matches) == 1:
+        logging.info(
+            "Mapped STT move %r to %s during an armed round",
+            command_text, alias_matches[0],
+        )
+        return alias_matches[0]
+    return None
 
 
 def score_rps_voice_move(voice_move):
@@ -98,8 +138,11 @@ def score_rps_voice_move(voice_move):
         result = RPS_TIE.get(rps_game_lang, "It's a tie!")
     else:
         result = RPS_LOSE.get(rps_game_lang, "You lose!")
-    puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
-    image_queue.put(puppy_image)
+    logging.info(
+        "Rock-paper-scissors scored: human=%s robot=%s result=%r",
+        voice_move, puppy_gesture, result,
+    )
+    show_rps_gesture(puppy_gesture)
     return result
 ai_on = True
 
@@ -176,6 +219,7 @@ cur_voice = voice0
 playing_heads_up = False
 heads_up_word = ""
 heads_up_questions = 0
+heads_up_game_language = None
 
 # Track last response for translation
 last_response = ""
@@ -215,10 +259,13 @@ class OutputItem:
     text: str
     language: LanguageChoice
     must_finish: bool = False
+    release_rps_gesture: bool = False
+    opens_rps_round: bool = False
 
 
 DEFAULT_LANGUAGE = LanguageChoice("English", "en-US", voice0)
 generation_languages = {0: DEFAULT_LANGUAGE}
+conversation_language_hint = None
 
 
 def configure_default_language(code, voice_name):
@@ -260,9 +307,42 @@ def transcript_matches_tts_echo(transcript, reference_text):
     if not transcript_text or not reference:
         return False
 
+    def compact_cjk_echo_text(text):
+        compact = re.sub(r"[^\w]", "", text.casefold())
+        # Chinese STT frequently swaps these common homophones in short echo
+        # fragments (for example, 它的高低 -> 他的高低).
+        return compact.translate(str.maketrans({
+            "他": "它", "她": "它",
+            "地": "的", "得": "的",
+        }))
+
+    transcript_cjk = compact_cjk_echo_text(transcript)
+    reference_cjk = compact_cjk_echo_text(reference_text)
+    has_cjk = any("\u3400" <= char <= "\u9fff" for char in transcript_cjk)
+    if has_cjk and len(transcript_cjk) >= 2:
+        if transcript_cjk in reference_cjk:
+            return True
+        if len(transcript_cjk) >= 4:
+            match = SequenceMatcher(None, transcript_cjk, reference_cjk)
+            covered = match.find_longest_match().size / len(transcript_cjk)
+            if covered >= 0.75:
+                return True
+    elif len(transcript_cjk) >= 4 and transcript_cjk in reference_cjk:
+        # Short English echo fragments such as "okay" previously bypassed
+        # both the eight-character containment rule and the three-word rule.
+        return True
+
     # This also handles languages that are commonly written without spaces.
     if len(transcript_text) >= 8 and transcript_text in reference:
         return True
+
+    # Streaming STT commonly changes one short word in playback echo (for
+    # example, "It's a tie" -> "It's a time"). Exact containment and token
+    # overlap both miss that case, so compare the normalized phrases fuzzily.
+    if min(len(transcript_text), len(reference)) >= 6:
+        similarity = SequenceMatcher(None, transcript_text, reference).ratio()
+        if similarity >= 0.88:
+            return True
 
     transcript_words = transcript_text.split()
     reference_words = set(reference.split())
@@ -298,6 +378,17 @@ def language_for_generation(generation):
         return generation_languages.get(generation, DEFAULT_LANGUAGE)
 
 
+def get_conversation_language_hint():
+    with generation_lock:
+        return conversation_language_hint
+
+
+def set_conversation_language_hint(language):
+    global conversation_language_hint
+    with generation_lock:
+        conversation_language_hint = language
+
+
 def enqueue_input(text, generation=None, language=None, command_text=None):
     generation = get_current_generation() if generation is None else generation
     language = language or language_for_generation(generation)
@@ -306,12 +397,26 @@ def enqueue_input(text, generation=None, language=None, command_text=None):
     input_text_queue.put(InputItem(generation, text, language, command_text))
 
 
-def enqueue_output(text, generation=None, language=None, must_finish=False):
+def enqueue_output(
+    text,
+    generation=None,
+    language=None,
+    must_finish=False,
+    release_rps_gesture=False,
+    opens_rps_round=False,
+):
     if not text:
         return
     generation = get_current_generation() if generation is None else generation
     language = language or language_for_generation(generation)
-    output_text_queue.put(OutputItem(generation, str(text), language, must_finish))
+    output_text_queue.put(OutputItem(
+        generation,
+        str(text),
+        language,
+        must_finish,
+        release_rps_gesture,
+        opens_rps_round,
+    ))
 
 
 class WebRTCAudioRouting:
@@ -571,7 +676,7 @@ class ChirpStreamingSession:
 
     _END = object()
 
-    def __init__(self, sample_rate):
+    def __init__(self, sample_rate, language_codes=None):
         from google.cloud import speech_v2 as cloud_speech
 
         self.cloud_speech = cloud_speech
@@ -590,15 +695,18 @@ class ChirpStreamingSession:
             client_options=ClientOptions(api_endpoint=endpoint),
         )
         self.sample_rate = sample_rate
+        self.language_codes = language_codes
         self.audio_queue = queue_module.Queue()
         self.transcript = ""
+        self.live_transcript = ""
+        self.transcript_lock = threading.Lock()
         self.language_code = None
         self.error = None
         self.thread = None
 
     def _requests(self):
         speech = self.cloud_speech
-        language_codes = [
+        language_codes = self.language_codes or [
             code.strip() for code in
             os.environ.get("GOOGLE_STT_LANGUAGE_CODES", "auto").split(",")
             if code.strip()
@@ -645,7 +753,12 @@ class ChirpStreamingSession:
                         interim = ""
                     else:
                         interim = text
+                    live_text = " ".join(final_parts + ([interim] if interim else []))
+                    with self.transcript_lock:
+                        self.live_transcript = live_text.strip()
             self.transcript = " ".join(final_parts).strip() or interim
+            with self.transcript_lock:
+                self.live_transcript = self.transcript
         except Exception as exc:
             self.error = exc
 
@@ -658,6 +771,10 @@ class ChirpStreamingSession:
     def feed(self, chunk):
         if self.thread:
             self.audio_queue.put(chunk)
+
+    def current_transcript(self):
+        with self.transcript_lock:
+            return self.live_transcript
 
     def finish(self):
         if not self.thread:
@@ -707,6 +824,12 @@ def show_status_image(status, expected_statuses=None):
             return False
 
         with status_image_lock:
+            if rps_gesture_display_active:
+                logging.debug(
+                    "Keeping rock-paper-scissors gesture; ignoring status %r",
+                    status,
+                )
+                return False
             if (expected_statuses is not None and
                     current_status_image not in expected_statuses):
                 logging.debug(
@@ -724,6 +847,81 @@ def show_status_image(status, expected_statuses=None):
     except Exception as e:
         logging.error(f"Failed to display status image for '{status}': {e}")
         return False
+
+
+def show_rps_gesture(gesture):
+    """Show and protect a robot gesture until its result speech completes."""
+    global current_status_image, rps_gesture_display_active
+    try:
+        image = Image.open(f"{RES_DIR}/{gesture}.jpg")
+        with status_image_lock:
+            rps_gesture_display_active = True
+            current_status_image = f"rps:{gesture}"
+            image_queue.put(image)
+        logging.info("Holding rock-paper-scissors gesture=%s", gesture)
+    except Exception:
+        logging.exception("Could not display rock-paper-scissors gesture=%s", gesture)
+        with status_image_lock:
+            rps_gesture_display_active = False
+
+
+def release_rps_gesture_display():
+    """Release the protected gesture and atomically restore the ready image."""
+    global current_status_image, rps_gesture_display_active
+    try:
+        ready_image = Image.open(f"{RES_DIR}/hello_ready.png")
+        with status_image_lock:
+            if not rps_gesture_display_active:
+                return
+            rps_gesture_display_active = False
+            current_status_image = "ready"
+            image_queue.put(ready_image)
+        logging.info("Rock-paper-scissors result finished; gesture released")
+    except Exception:
+        logging.exception("Could not release rock-paper-scissors gesture display")
+        with status_image_lock:
+            rps_gesture_display_active = False
+
+
+def finish_rps_countdown(open_round):
+    """Arm the move only when the spoken countdown completed successfully."""
+    global rps_countdown_active, rps_round_pending
+    rps_countdown_active = False
+    rps_round_pending = bool(open_round)
+    if open_round:
+        logging.info("Rock-paper-scissors countdown completed; move window is open")
+    else:
+        logging.info("Rock-paper-scissors countdown cancelled; move window stays closed")
+
+
+def rps_move_window_reached(playback_fraction):
+    threshold = min(1.0, max(
+        0.0,
+        float(os.environ.get("RPS_MOVE_WINDOW_FRACTION", "0.80")),
+    ))
+    return playback_fraction >= threshold
+
+
+def rps_input_mode():
+    mode = os.environ.get("RPS_INPUT_MODE", "camera").strip().casefold()
+    return mode if mode in {"camera", "voice"} else "camera"
+
+
+def queue_rps_camera_capture(generation, language):
+    """Queue one explicit camera-scoring turn after the countdown."""
+    global rps_countdown_active, rps_round_pending
+    rps_countdown_active = False
+    rps_round_pending = False
+    if not generation_is_current(generation):
+        logging.info("Skipping stale rock-paper-scissors camera capture")
+        return
+    enqueue_input(
+        "Capture and score the player's rock-paper-scissors hand gesture.",
+        generation,
+        language,
+        command_text="capture rps gesture",
+    )
+    logging.info("Rock-paper-scissors countdown completed; camera capture queued")
 
 
 class NoiseFloorTracker:
@@ -746,6 +944,10 @@ class NoiseFloorTracker:
     def update(self, rms):
         alpha = self.rise_alpha if rms > self.floor else self.fall_alpha
         self.floor += alpha * (rms - self.floor)
+
+
+class AudioInputStreamClosed(RuntimeError):
+    """Signal that PortAudio input must be opened again."""
 
 
 class NoiseRobustSTT:
@@ -815,6 +1017,18 @@ class NoiseRobustSTT:
             fall_alpha=float(os.environ.get("NOISE_FLOOR_FALL_ALPHA", "0.02")),
         )
         self.barge_in_margin_rms = max(0, int(os.environ.get("BARGE_IN_MARGIN_RMS", "150")))
+        self.voice_max_crest_factor = max(
+            1.0, float(os.environ.get("BARGE_IN_VOICE_MAX_CREST_FACTOR", "10.0"))
+        )
+        self.voice_max_spectral_flatness = min(
+            1.0, max(0.0, float(os.environ.get("BARGE_IN_VOICE_MAX_FLATNESS", "0.65")))
+        )
+        self.voice_min_speech_band_ratio = min(
+            1.0, max(0.0, float(os.environ.get("BARGE_IN_VOICE_MIN_BAND_RATIO", "0.55")))
+        )
+        self.voice_min_active_ratio = min(
+            1.0, max(0.0, float(os.environ.get("BARGE_IN_VOICE_MIN_ACTIVE_RATIO", "0.03")))
+        )
 
         logging.info(
             "STT front end initialized: WebRTC VAD=%d, pre-roll=%dms, "
@@ -874,6 +1088,52 @@ class NoiseRobustSTT:
             logging.warning(f"VAD exception ({e}), amplitude fallback: RMS={rms:.0f} threshold={adaptive_threshold:.0f} speech={result}")
             return result
 
+    def is_voice_like_candidate(self, frames):
+        """Reject impulsive and spectrally flat sounds before immediate barge-in."""
+        if not frames:
+            return False
+        samples = np.frombuffer(b"".join(frames), dtype=np.int16).astype(np.float32)
+        if samples.size < max(1, int(self.sample_rate * 0.08)):
+            return False
+
+        samples -= np.mean(samples)
+        rms = float(np.sqrt(np.mean(samples ** 2)))
+        if rms <= 1.0:
+            return False
+        peak = float(np.max(np.abs(samples)))
+        crest_factor = peak / rms
+        active_ratio = float(np.mean(np.abs(samples) >= peak * 0.25))
+
+        windowed = samples * np.hanning(samples.size)
+        power = np.abs(np.fft.rfft(windowed)) ** 2
+        frequencies = np.fft.rfftfreq(samples.size, d=1.0 / self.sample_rate)
+        analysis_mask = (frequencies >= 80.0) & (frequencies <= 8000.0)
+        speech_mask = (frequencies >= 80.0) & (frequencies <= 4000.0)
+        analysis_power = power[analysis_mask]
+        if not analysis_power.size or float(np.sum(analysis_power)) <= 0.0:
+            return False
+        safe_power = np.maximum(analysis_power, 1e-12)
+        spectral_flatness = float(
+            np.exp(np.mean(np.log(safe_power))) / np.mean(safe_power)
+        )
+        speech_band_ratio = float(
+            np.sum(power[speech_mask]) / np.sum(analysis_power)
+        )
+
+        accepted = (
+            crest_factor <= self.voice_max_crest_factor and
+            spectral_flatness <= self.voice_max_spectral_flatness and
+            speech_band_ratio >= self.voice_min_speech_band_ratio and
+            active_ratio >= self.voice_min_active_ratio
+        )
+        logging.info(
+            "Barge-in voice gate accepted=%s: crest=%.2f, flatness=%.3f, "
+            "speech-band=%.3f, active=%.3f",
+            accepted, crest_factor, spectral_flatness,
+            speech_band_ratio, active_ratio,
+        )
+        return accepted
+
     def transcribe_audio(self, audio_bytes):
         """
         Transcribe audio using Google Speech-to-Text API.
@@ -891,18 +1151,25 @@ class NoiseRobustSTT:
             audio = speech.RecognitionAudio(content=audio_bytes)
 
             model_type = "latest_short" if duration < 3.0 else "latest_long"
-            fallback_codes = [
+            preferred_codes = preferred_stt_language_codes()
+            primary_code = preferred_codes[0] if preferred_codes else self.language_code
+            configured_fallbacks = [
                 code.strip() for code in os.environ.get(
                     "GOOGLE_STT_FALLBACK_LANGUAGE_CODES",
                     "es-ES,cmn-CN,fr-FR",
                 ).split(",")
-                if code.strip() and code.strip() != self.language_code
-            ][:3]
+                if code.strip()
+            ]
+            fallback_codes = []
+            for code in (preferred_codes[1:] if preferred_codes else []) + configured_fallbacks:
+                if code != primary_code and code not in fallback_codes:
+                    fallback_codes.append(code)
+            fallback_codes = fallback_codes[:3]
 
             config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=self.sample_rate,
-                language_code=self.language_code,
+                language_code=primary_code,
                 enable_automatic_punctuation=True,
                 model=model_type,
                 audio_channel_count=self.channels,
@@ -920,9 +1187,9 @@ class NoiseRobustSTT:
                     transcript = result.alternatives[0].transcript
                     confidence = result.alternatives[0].confidence
                     try:
-                        detected_lang = result.language_code or self.language_code
+                        detected_lang = result.language_code or primary_code
                     except Exception:
-                        detected_lang = self.language_code
+                        detected_lang = primary_code
                     logging.info(f"Transcription: '{transcript}' (confidence: {confidence:.2%}, detected lang: {detected_lang})")
                     return transcript, detected_lang
                 else:
@@ -956,9 +1223,12 @@ class NoiseRobustSTT:
         generation = None
         was_barge_in = False
         deferred_barge_in_validation = False
+        barge_in_playback_stopped = False
+        last_barge_in_partial = ""
         candidate_during_tts = False
         barge_in_reference = ""
         candidate_peak_rms = 0.0
+        candidate_frames = []
         state = "IDLE"
         max_frames = int(float(os.environ.get("MAX_UTTERANCE_SECONDS", "20")) * 1000 / frame_ms)
         min_speech_frames = max(1, int(os.environ.get("MIN_SPEECH_MS", "300")) // frame_ms)
@@ -968,13 +1238,30 @@ class NoiseRobustSTT:
             try:
                 data = stream.read(self.chunk_size, exception_on_overflow=False)
             except OSError as exc:
+                stream_is_closed = (
+                    getattr(exc, "errno", None) == -9988 or
+                    "stream closed" in str(exc).casefold()
+                )
+                if stream_is_closed:
+                    if streaming is not None:
+                        try:
+                            streaming.finish()
+                        except Exception:
+                            logging.debug(
+                                "Could not finish STT stream after input closure",
+                                exc_info=True,
+                            )
+                    logging.error("Audio input stream closed; requesting reopen")
+                    raise AudioInputStreamClosed(str(exc)) from exc
                 logging.warning("Audio input overflow; resetting VAD candidate: %s", exc)
                 pre_roll.clear()
                 speech_frames = 0
                 candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
+                candidate_frames.clear()
                 state = "IDLE"
+                time.sleep(frame_ms / 1000.0)
                 continue
 
             # Without verified AEC, listening during TTS would let the robot
@@ -985,6 +1272,7 @@ class NoiseRobustSTT:
                 candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
+                candidate_frames.clear()
                 state = "IDLE"
                 continue
 
@@ -999,6 +1287,7 @@ class NoiseRobustSTT:
                 candidate_gap_frames = 0
                 candidate_during_tts = False
                 candidate_peak_rms = 0.0
+                candidate_frames.clear()
                 state = "IDLE"
                 continue
 
@@ -1028,9 +1317,11 @@ class NoiseRobustSTT:
                 if is_speech:
                     if speech_frames == 0:
                         candidate_during_tts = tts_is_active
+                        candidate_frames.clear()
                     elif tts_is_active:
                         candidate_during_tts = True
                     candidate_peak_rms = max(candidate_peak_rms, audio_rms)
+                    candidate_frames.append(data)
                     speech_frames += 1
                     candidate_gap_frames = 0
                     state = "BARGE_CANDIDATE"
@@ -1046,6 +1337,7 @@ class NoiseRobustSTT:
                         candidate_gap_frames = 0
                         candidate_during_tts = False
                         candidate_peak_rms = 0.0
+                        candidate_frames.clear()
                         state = "IDLE"
 
                 required_frames = (
@@ -1055,8 +1347,38 @@ class NoiseRobustSTT:
                 if speech_frames < required_frames:
                     continue
 
+                if (candidate_during_tts and
+                        not self.is_voice_like_candidate(candidate_frames)):
+                    logging.info(
+                        "Rejected non-voice barge-in candidate; playback continues"
+                    )
+                    speech_frames = 0
+                    candidate_gap_frames = 0
+                    candidate_during_tts = False
+                    candidate_peak_rms = 0.0
+                    candidate_frames.clear()
+                    state = "IDLE"
+                    continue
+
                 was_barge_in = candidate_during_tts
-                deferred_barge_in_validation = was_barge_in and not self.cancel_barge_in_on_vad
+                heads_up_barge_in = (
+                    was_barge_in and
+                    playing_heads_up and
+                    heads_up_game_language is not None
+                )
+                camera_countdown_barge_in = (
+                    was_barge_in and
+                    rps_countdown_active and
+                    rps_input_mode() == "camera"
+                )
+                transcript_validated_game_barge_in = (
+                    heads_up_barge_in or
+                    camera_countdown_barge_in
+                )
+                deferred_barge_in_validation = was_barge_in and (
+                    not self.cancel_barge_in_on_vad or
+                    transcript_validated_game_barge_in
+                )
                 # VAD is only a candidate signal.  Keep the current generation
                 # until STT returns real text, otherwise a knock can invalidate
                 # an LLM response that has not reached TTS yet.
@@ -1064,15 +1386,18 @@ class NoiseRobustSTT:
                 if deferred_barge_in_validation:
                     barge_in_reference = tts_playback_text
                     logging.info(
-                        "Barge-in candidate buffered; waiting for STT validation "
-                        "before cancelling generation %d",
-                        generation,
+                        "%s barge-in candidate buffered; waiting for a "
+                        "non-echo streaming transcript before stopping playback",
+                        ("Heads Up" if heads_up_barge_in else
+                         "Rock-paper-scissors countdown" if camera_countdown_barge_in else
+                         "Deferred"),
                     )
                 elif was_barge_in:
                     # Optional low-latency mode may stop active audio on VAD,
                     # but it still must not invalidate queued work until STT
                     # verifies that the event contained words.
                     stop_tts_playback()
+                    barge_in_playback_stopped = True
                     barge_in_reference = tts_playback_text
                     logging.info(
                         "Immediate local barge-in playback stop requested "
@@ -1103,7 +1428,16 @@ class NoiseRobustSTT:
                     speech_frames * frame_ms, len(pre_roll) * frame_ms,
                 )
                 try:
-                    streaming = ChirpStreamingSession(self.sample_rate)
+                    streaming_languages = preferred_stt_language_codes()
+                    if streaming_languages:
+                        logging.info(
+                            "Conditioning streaming STT on conversation languages: %s",
+                            ", ".join(streaming_languages),
+                        )
+                    streaming = ChirpStreamingSession(
+                        self.sample_rate,
+                        language_codes=streaming_languages,
+                    )
                     streaming.start(captured)
                 except Exception as exc:
                     streaming = None
@@ -1113,6 +1447,35 @@ class NoiseRobustSTT:
             captured.append(data)
             if streaming:
                 streaming.feed(data)
+
+            if (deferred_barge_in_validation and
+                    not barge_in_playback_stopped and
+                    tts_active_event.is_set() and streaming):
+                partial = streaming.current_transcript().strip()
+                compact_partial = re.sub(r"[^\w]", "", partial)
+                has_cjk_partial = any(
+                    "\u3400" <= char <= "\u9fff" for char in compact_partial
+                )
+                partial_is_actionable = (
+                    len(compact_partial) >= (2 if has_cjk_partial else 4)
+                )
+                if (partial_is_actionable and
+                        partial != last_barge_in_partial):
+                    last_barge_in_partial = partial
+                    if transcript_matches_tts_echo(partial, barge_in_reference):
+                        logging.info(
+                            "Streaming barge-in partial %r matches current "
+                            "TTS; playback continues",
+                            partial,
+                        )
+                    else:
+                        stop_tts_playback()
+                        barge_in_playback_stopped = True
+                        logging.info(
+                            "Streaming barge-in partial %r is new human "
+                            "speech; playback stop requested",
+                            partial,
+                        )
 
             if is_speech:
                 voiced_frames += 1
@@ -1161,11 +1524,26 @@ class NoiseRobustSTT:
                     return None, None, generation, was_barge_in
                 if transcript_matches_tts_echo(transcript, barge_in_reference):
                     logging.info(
-                        "Ignoring probable TTS echo transcript %r; TTS was not interrupted",
+                        "Ignoring probable TTS echo transcript %r; playback %s",
                         transcript,
+                        ("had already stopped" if barge_in_playback_stopped
+                         else "was allowed to continue"),
                     )
                     show_status_image("ready", expected_statuses={"completed"})
                     return None, None, generation, was_barge_in
+
+            if transcript and rps_gesture_display_active:
+                # Camera scoring and its short winner announcement are one
+                # atomic game result. A transcript already in flight (the
+                # countdown tail commonly becomes "好") must not advance the
+                # generation between score calculation and result playback.
+                logging.info(
+                    "Ignoring transcript %r while rock-paper-scissors result "
+                    "is protected",
+                    transcript,
+                )
+                show_status_image("ready", expected_statuses={"completed"})
+                return None, None, generation, was_barge_in
 
             if transcript:
                 if not generation_is_current(generation):
@@ -1203,13 +1581,14 @@ def send_response(text, generation=None, language=None):
 
 
 #heads up ai prompt
-def create_heads_up_prompt(secret_word):
+def create_heads_up_prompt(secret_word, response_language="English"):
     prompt = f"""
 You are an AI assistant playing a guessing game similar to "Heads-Up" or "20 Questions."
 I have a secret word in mind, and I will tell it to you now.
 Your role is to be the "Knower" or "Answerer." I will be the "Guesser."
 
 **The Secret Word is: {secret_word}**
+**The player's language is: {response_language}. Reply naturally in that language.**
 
 Your task is to help me guess this secret word by answering my questions.
 
@@ -1233,10 +1612,121 @@ Here are the rules for how you must behave:
     *   "No, that's not the word. Keep trying!" if I am incorrect.
 13.  **Goal:** Your ultimate goal is to help me guess the secret word by accurately and concisely answering my questions within these rules.
 14.  **DO NOT ASK Questions** it is your job to answer questions, not ask them
+15.  **Never output stage directions or placeholders** such as "waiting for the user to ask a question". If the input is not a real question, respond only with a short natural acknowledgement.
+16.  **Readiness means clue:** If the player says "okay", "ready", "please", "go ahead", "continue", or a similar acknowledgement, immediately provide one concise new clue. Do not respond with another acknowledgement.
 
 Let's begin. I have provided the secret word above. Await my first question after your acknowledgment. My next message will be a question.
 """
     return prompt
+
+
+HEADS_UP_READY_TEXTS = {
+    "Chinese": "好的，我已经记住这个词了。请问第一个问题吧。",
+    "Cantonese": "好，我記住咗呢個詞喇。請問第一個問題啦。",
+}
+
+HEADS_UP_ERROR_TEXTS = {
+    "Chinese": "抱歉，我刚才无法回答。请再问一次。",
+    "Cantonese": "唔好意思，我頭先答唔到。請再問一次。",
+}
+
+
+def heads_up_ready_text(language_name):
+    return HEADS_UP_READY_TEXTS.get(
+        language_name,
+        "Okay, I have the secret word. I'm ready for your first question.",
+    )
+
+
+def heads_up_error_text(language_name):
+    return HEADS_UP_ERROR_TEXTS.get(
+        language_name,
+        "Sorry, I couldn't answer that. Please ask again.",
+    )
+
+
+def heads_up_success_text(language_name, secret_word, guess_count):
+    if language_name == "Chinese":
+        return f"恭喜你！你用了{guess_count}次猜中答案：{secret_word}！"
+    if language_name == "Cantonese":
+        return f"恭喜你！你用咗{guess_count}次就估中答案：{secret_word}！"
+    return (
+        f"Congratulations! You guessed the word: {secret_word}, "
+        f"in {guess_count} guesses!"
+    )
+
+
+def heads_up_answer_is_correct(answer, secret_word):
+    """Recognize affirmative correct-guess answers in English or Chinese."""
+    normalized_answer = normalize_command_text(answer)
+    compact_answer = re.sub(r"[^\w]", "", answer.casefold())
+    compact_word = re.sub(r"[^\w]", "", secret_word.casefold())
+    if not compact_word or compact_word not in compact_answer:
+        return False
+    success_phrases = (
+        "that's it",
+        "that is it",
+        "you got it",
+        "correct",
+        "答对",
+        "答對",
+        "猜对",
+        "猜對",
+        "没错",
+        "沒錯",
+        "就是它",
+        "就係佢",
+        "估中",
+    )
+    return any(
+        phrase in normalized_answer or phrase in compact_answer
+        for phrase in success_phrases
+    )
+
+
+def heads_up_answer_is_placeholder(answer):
+    compact = re.sub(r"[^\w]", "", str(answer or "").casefold())
+    placeholders = (
+        "等待用户提问",
+        "等待提问",
+        "waitingfortheusertoaskaquestion",
+        "waitingforuserinput",
+    )
+    return any(phrase in compact for phrase in placeholders)
+
+
+def heads_up_requests_clue(command_text):
+    """Treat readiness/filler turns as a request for a clue, not an ack loop."""
+    normalized = normalize_command_text(command_text)
+    exact_requests = {
+        "ok", "okay", "please", "okay please", "ok please",
+        "ready", "i'm ready", "im ready", "go ahead", "continue", "next",
+        "start", "let's start", "lets start", "what do you mean okay",
+    }
+    clue_phrases = (
+        "give me a clue", "give me a hint", "tell me a clue",
+        "tell me a hint", "next clue", "next hint",
+    )
+    return (
+        normalized in exact_requests or
+        any(phrase in normalized for phrase in clue_phrases)
+    )
+
+
+def model_response_text(response):
+    """Return non-empty text from a LangChain response, including block content."""
+    content = getattr(response, "content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return " ".join(part.strip() for part in parts if part.strip()).strip()
+    return str(content).strip() if content is not None else ""
 
 def detect_lang_usage(prompt, lang):
     prompt = prompt.casefold()
@@ -1254,29 +1744,11 @@ def detect_lang_usage(prompt, lang):
 
     return "Unknown"
 
-def detect_voice_from_transcript(transcript, stt_lang_code=None):
-    """
-    Detect the appropriate TTS voice from lang_voices based on the STT-reported
-    language code and Unicode script ranges (reliable for CJK/Hebrew scripts).
-    Returns the matching voice from lang_voices, or None to use the default voice.
-    """
+def detect_script_voice(transcript):
+    """Return a voice when the written script identifies the language reliably."""
     def _any_in_range(text, lo, hi):
         return any(lo <= ord(c) <= hi for c in text)
 
-    # STT lang code is the most reliable signal — check it first.
-    if stt_lang_code:
-        normalized_code = stt_lang_code.replace("_", "-")
-        lang_name = lang_code_to_name.get(normalized_code)
-        if not lang_name:
-            lang_name = lang_code_to_name.get(normalized_code.split("-", 1)[0])
-        if lang_name:
-            voice = lang_voices.get(lang_name)
-            if voice:
-                logging.info(f"Detected language '{lang_name}' via STT code '{stt_lang_code}'")
-                return voice
-
-    # Fallback: Unicode script detection for transcripts where the STT code
-    # was missing or didn't match (e.g. mixed-code responses).
     if transcript:
         has_hiragana = _any_in_range(transcript, 0x3040, 0x309F)
         has_katakana = _any_in_range(transcript, 0x30A0, 0x30FF)
@@ -1298,6 +1770,32 @@ def detect_voice_from_transcript(transcript, stt_lang_code=None):
         if has_hangul:
             logging.info("Detected Korean script in transcript")
             return lang_voices.get("Korean")
+
+    return None
+
+
+def detect_voice_from_transcript(transcript, stt_lang_code=None):
+    """
+    Detect the appropriate TTS voice from Unicode script or the STT language.
+
+    An unambiguous written script wins over STT metadata. This prevents an
+    erroneous ``language=en`` result from assigning an English voice to text
+    that is visibly Chinese, Japanese, Korean, or Hebrew.
+    """
+    script_voice = detect_script_voice(transcript)
+    if script_voice:
+        return script_voice
+
+    if stt_lang_code:
+        normalized_code = stt_lang_code.replace("_", "-")
+        lang_name = lang_code_to_name.get(normalized_code)
+        if not lang_name:
+            lang_name = lang_code_to_name.get(normalized_code.split("-", 1)[0])
+        if lang_name:
+            voice = lang_voices.get(lang_name)
+            if voice:
+                logging.info(f"Detected language '{lang_name}' via STT code '{stt_lang_code}'")
+                return voice
 
     return None  # Language not in lang_voices — caller uses default voice
 
@@ -1331,41 +1829,154 @@ LANGUAGE_TTS_CODES = {
     "Korean": "ko-KR",
 }
 
+CLOUD_TRANSLATE_TARGET_CODES = {
+    "English": "en",
+    "Japanese": "ja",
+    "Chinese": "zh-CN",
+    "Italian": "it",
+    "German": "de",
+    "French": "fr",
+    "Cantonese": "yue",
+    "Spanish": "es",
+    "Hebrew": "he",
+    "Korean": "ko",
+}
+
+
+def preferred_stt_language_codes():
+    """Narrow Chirp language ID using established conversation context."""
+    hint = get_conversation_language_hint()
+    if not hint:
+        return None
+    stt_code = {
+        "Chinese": "cmn-Hans-CN",
+        "Cantonese": "yue-Hant-HK",
+    }.get(hint.name, hint.code)
+    common_codes = ["en-US", "cmn-Hans-CN"]
+    codes = [stt_code]
+    for code in common_codes:
+        if code not in codes:
+            codes.append(code)
+    return codes[:3]
+
 
 def choose_language(transcript, stt_language_code=None):
     """Choose one dominant response/TTS language for this utterance.
 
-    An explicit request such as "reply in Japanese" wins. Otherwise Chirp's
-    language ID is primary and Unicode script detection is the fallback. Mixed
-    speech is therefore transcribed as a whole and follows its dominant STT
-    language rather than switching voices in the middle of one sentence.
+    An explicit request wins, followed by an unambiguous Unicode script or an
+    explicit STT language. Only short transcripts without usable STT language
+    metadata retain the established conversation language.
     """
     requested_name, requested_voice = get_voice(transcript)
     if requested_name:
-        return LanguageChoice(
+        language = LanguageChoice(
             requested_name,
             LANGUAGE_TTS_CODES[requested_name],
             requested_voice,
         )
+        set_conversation_language_hint(language)
+        return language
 
+    normalized_stt_code = (stt_language_code or "").replace("_", "-")
+    has_explicit_stt_language = normalized_stt_code.casefold() not in {
+        "", "und", "auto",
+    }
     voice = detect_voice_from_transcript(transcript, stt_language_code)
     if voice:
         language_name = next(
             (name for name, candidate in lang_voices.items() if candidate == voice),
             "English",
         )
-        return LanguageChoice(
+        detected_language = LanguageChoice(
             language_name,
             LANGUAGE_TTS_CODES[language_name],
             voice,
         )
+        script_voice = detect_script_voice(transcript)
+        hint = get_conversation_language_hint()
+        words = re.findall(r"\w+", transcript, flags=re.UNICODE)
+        short_latin_utterance = (
+            not script_voice and
+            len(words) <= 3 and
+            len(transcript.strip()) <= 20
+        )
+        if (hint and hint.name != detected_language.name and
+                short_latin_utterance and not has_explicit_stt_language):
+            logging.info(
+                "Keeping conversation language %s for ambiguous short STT "
+                "result %r without an explicit language",
+                hint.name, transcript,
+            )
+            return hint
+        if script_voice or has_explicit_stt_language or not short_latin_utterance:
+            set_conversation_language_hint(detected_language)
+        return detected_language
+    hint = get_conversation_language_hint()
+    words = re.findall(r"\w+", transcript, flags=re.UNICODE)
+    if hint and len(words) <= 3 and len(transcript.strip()) <= 20:
+        logging.info(
+            "Keeping conversation language %s for short STT result %r "
+            "without a usable language code",
+            hint.name, transcript,
+        )
+        return hint
     return DEFAULT_LANGUAGE
 
 
+def language_for_tts_text(text, fallback_language):
+    """Choose TTS from response script, independent of imperfect input STT."""
+    script_voice = detect_script_voice(text)
+    if not script_voice:
+        return fallback_language
+
+    language_name = next(
+        (name for name, candidate in lang_voices.items() if candidate == script_voice),
+        fallback_language.name,
+    )
+    hint = get_conversation_language_hint()
+    if language_name == "Chinese":
+        if fallback_language.name == "Cantonese":
+            return fallback_language
+        if hint and hint.name == "Cantonese":
+            return hint
+    language = LanguageChoice(
+        language_name,
+        LANGUAGE_TTS_CODES[language_name],
+        script_voice,
+    )
+    set_conversation_language_hint(language)
+    return language
+
+
+def response_has_wrong_script(text, expected_language):
+    """Detect clear English/non-Latin response-language mismatches."""
+    script_voice = detect_script_voice(text)
+    script_name = next(
+        (name for name, candidate in lang_voices.items()
+         if candidate == script_voice),
+        None,
+    )
+    if expected_language.name == "English":
+        return script_name is not None
+    if expected_language.name in {"Chinese", "Cantonese"}:
+        return script_name != "Chinese"
+    if expected_language.name in {"Japanese", "Korean", "Hebrew"}:
+        return script_name != expected_language.name
+    # Latin-script languages cannot be distinguished reliably from English
+    # with Unicode alone; their explicit model instruction remains primary.
+    return False
+
+
 def with_language_instruction(text, language):
-    if language.name == "English":
-        return text
-    return f"{text}\nReply naturally and concisely in {language.name}."
+    # State the language on every turn. Relying on chat history for English
+    # lets recent Chinese media or conversation pull an English question back
+    # into Chinese even when STT identified the question correctly.
+    return (
+        f"{text}\n"
+        f"Reply naturally and concisely in {language.name} only. "
+        "Use the language of this instruction even if earlier turns used a "
+        "different language."
+    )
 
 
 def normalize_command_text(text):
@@ -1374,8 +1985,54 @@ def normalize_command_text(text):
     return re.sub(r"\s+", " ", without_punctuation).strip()
 
 
+HEADS_UP_CHINESE_ALIASES = (
+    "你比我猜",
+    "你说我猜",
+    "你說我猜",
+    "猜词游戏",
+    "猜詞遊戲",
+    "猜单词游戏",
+    "猜單詞遊戲",
+    "额头猜词",
+    "額頭猜詞",
+    "抬头猜词",
+    "抬頭猜詞",
+    "疯狂猜词",
+    "瘋狂猜詞",
+    "猜猜我是谁",
+    "猜猜我是誰",
+)
+
+HEADS_UP_CHINESE_CANCEL_PHRASES = (
+    "不想",
+    "不要",
+    "别玩",
+    "別玩",
+    "停止",
+    "退出",
+    "结束",
+    "結束",
+)
+
+
+def is_heads_up_start_command(command_text, original_text=""):
+    """Recognize an English command or a commonly spoken Chinese game name."""
+    if "heads up" in command_text and any(
+        action in command_text for action in ("play", "start", "begin")
+    ):
+        return True
+
+    # Check the original transcript because machine translation often renders
+    # Chinese game names as generic phrases such as "guessing game", losing
+    # the specific Heads Up intent needed by the deterministic router.
+    compact_original = re.sub(r"[^\w]", "", original_text.casefold())
+    if any(phrase in compact_original for phrase in HEADS_UP_CHINESE_CANCEL_PHRASES):
+        return False
+    return any(alias in compact_original for alias in HEADS_UP_CHINESE_ALIASES)
+
+
 class CommandTranslator:
-    """Translate each transcript to English solely for command routing."""
+    """Cloud translation for command routing and response-language repair."""
 
     def __init__(self):
         credentials, detected_project = google.auth.default()
@@ -1385,13 +2042,13 @@ class CommandTranslator:
         self.client = translate_v3.TranslationServiceClient(credentials=credentials)
         self.parent = f"projects/{project_id}/locations/global"
 
-    def to_english(self, text):
+    def translate(self, text, target_language_code):
         response = self.client.translate_text(
             request={
                 "parent": self.parent,
                 "contents": [text],
                 "mime_type": "text/plain",
-                "target_language_code": "en",
+                "target_language_code": target_language_code,
             },
             timeout=float(os.environ.get("GOOGLE_TRANSLATE_TIMEOUT", "5")),
         )
@@ -1401,6 +2058,9 @@ class CommandTranslator:
         if not translated:
             raise RuntimeError("Cloud Translation returned an empty translation.")
         return translated
+
+    def to_english(self, text):
+        return self.translate(text, "en")
 
 move_cmd_functions = {
                  "action": move_api.init_movement,
@@ -1451,11 +2111,12 @@ def get_move_cmd(input_text, command_dict):
     return None
 
 def close_ai():
-    global ai_on, current_status_image
+    global ai_on, current_status_image, rps_gesture_display_active
     ai_on = False
     stop_tts_playback()
     image = Image.open(f"{RES_DIR}/logo2.png")
     with status_image_lock:
+        rps_gesture_display_active = False
         image_queue.put(image)
         current_status_image = "off"
 
@@ -1554,7 +2215,7 @@ def remove_asterisk_text(text):
 
 def stt_task_v8():
     """Continuously listen to the AEC/NS source, including while TTS plays."""
-    global cur_voice, rps_game_lang, rps_round_pending
+    global cur_voice, rps_game_lang, rps_round_pending, rps_countdown_active
 
     logging.info("Starting full-duplex WebRTC AEC/NS -> VAD -> streaming STT front end")
     py_audio = google_api.init_pyaudio()
@@ -1575,14 +2236,17 @@ def stt_task_v8():
         vad_aggressiveness=int(os.environ.get("VAD_AGGRESSIVENESS", "1")),
         language_code=os.environ.get("LANGUAGE_CODE", "en-US"),
     )
-    stream = py_audio.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=native_rate,
-        input=True,
-        input_device_index=input_index,
-        frames_per_buffer=native_chunk,
-    )
+    def open_input_stream():
+        return py_audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=native_rate,
+            input=True,
+            input_device_index=input_index,
+            frames_per_buffer=native_chunk,
+        )
+
+    stream = open_input_stream()
     show_status_image("ready")
 
     try:
@@ -1600,7 +2264,24 @@ def stt_task_v8():
         "shut up",
     }
     while True:
-        user_input, detected_code, generation, was_barge_in = recognizer.listen_full_duplex(stream)
+        try:
+            user_input, detected_code, generation, was_barge_in = (
+                recognizer.listen_full_duplex(stream)
+            )
+        except AudioInputStreamClosed:
+            try:
+                stream.close()
+            except Exception:
+                logging.debug("Closed PortAudio stream rejected close()", exc_info=True)
+            time.sleep(0.25)
+            try:
+                stream = open_input_stream()
+            except Exception:
+                logging.exception("Could not reopen audio input; retrying in one second")
+                time.sleep(1.0)
+                continue
+            logging.info("Audio input stream reopened after unexpected closure")
+            continue
         if not user_input:
             continue
         if not generation_is_current(generation):
@@ -1641,6 +2322,11 @@ def stt_task_v8():
             )
         else:
             language = spoken_language
+        if playing_heads_up and heads_up_game_language is not None:
+            # Keep the language chosen when the game started. Short answers
+            # such as numbers often have STT language "und" and must not
+            # silently switch a Chinese game back to the English default.
+            language = heads_up_game_language
         set_generation_language(generation, language)
         cur_voice = language.voice  # compatibility for game code outside the queues
         logging.info(
@@ -1650,6 +2336,7 @@ def stt_task_v8():
 
         move_key = get_move_cmd(command_text, move_cmd_functions)
         sys_cmd_key, sys_cmd_func = get_sys_cmd(command_text, sys_cmds_functions)
+        heads_up_requested = is_heads_up_start_command(command_text, user_input)
 
         if playing_heads_up:
             enqueue_input(user_input, generation, language, command_text)
@@ -1666,24 +2353,65 @@ def stt_task_v8():
             enqueue_output(f"OK, my friend, {move_key} immediately.", generation, language)
         elif not ai_on:
             continue
-        elif "heads up" in command_text and "play" in command_text:
-            enqueue_input(user_input, generation, language, command_text)
+        elif heads_up_requested:
+            # Canonicalize the routing intent while retaining the original
+            # transcript and its detected language for the game interaction.
+            enqueue_input(user_input, generation, language, "play heads up")
         elif (("don't want" in command_text and "play" in command_text) or
               ("do not want" in command_text and "play" in command_text) or
               "exit" in command_text or "quit" in command_text or
               ("stop" in command_text and
                ("game" in command_text or "playing" in command_text))):
             rps_round_pending = False
+            rps_countdown_active = False
             enqueue_input(user_input, generation, language, command_text)
-        elif rps_round_pending and (voice_move := get_rps_voice_move(command_text)):
-            rps_round_pending = False
-            result = score_rps_voice_move(voice_move)
-            enqueue_output(result, generation, language, must_finish=True)
-        elif (any(word in command_text for word in ("rock", "paper", "scissors")) or
+        elif rps_round_pending:
+            voice_move = get_rps_voice_move(
+                command_text,
+                allow_stt_aliases=True,
+            )
+            if voice_move:
+                rps_round_pending = False
+                result = score_rps_voice_move(voice_move)
+                enqueue_output(
+                    result,
+                    generation,
+                    language,
+                    must_finish=True,
+                    release_rps_gesture=True,
+                )
+            else:
+                logging.info(
+                    "Unrecognized move %r while round remains armed",
+                    command_text,
+                )
+                enqueue_output(
+                    RPS_INVALID_MOVE.get(
+                        rps_game_lang,
+                        "Please say rock, paper, or scissors.",
+                    ),
+                    generation,
+                    language,
+                )
+        elif rps_countdown_active:
+            logging.info(
+                "Ignoring speech while rock-paper-scissors countdown is active"
+            )
+        elif (all(word in command_text for word in RPS_GESTURES) or
               ("game" in command_text and "play" in command_text)):
-            rps_round_pending = True
+            rps_round_pending = False
+            rps_countdown_active = True
             rps_game_lang = language.name
-            enqueue_output(GAME_TEXTS.get(rps_game_lang, GAME_TEXT), generation, language)
+            enqueue_output(
+                GAME_TEXTS.get(rps_game_lang, GAME_TEXT),
+                generation,
+                language,
+                opens_rps_round=True,
+            )
+        elif get_rps_voice_move(command_text):
+            logging.info(
+                "Ignoring bare rock-paper-scissors move because no round is armed"
+            )
         elif requested_name and last_response and any(
             phrase in command_text for phrase in
             ("say that", "repeat that", "translate that", "say it", "repeat it")
@@ -1705,7 +2433,8 @@ def gemini_task():
     """
     Task for handling Gemini AI interactions.
     """
-    global last_response, playing_heads_up, heads_up_word, rps_round_pending
+    global last_response, playing_heads_up, heads_up_word
+    global heads_up_game_language, rps_round_pending
 
     logging.debug("gemini task start.")
     history_file_path = "res/ece_history.json"
@@ -1714,6 +2443,7 @@ def gemini_task():
     init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breath responses. If the input contains a language other than English, for example, language A, please answer the question in language A."
     response = google_api.ai_text_response(conversation, init_input)
     logging.debug(f"init llm and first response: {response}")
+    response_translator = None
 
     multi_model = ChatVertexAI(
         model_name=os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash'),
@@ -1757,10 +2487,18 @@ def gemini_task():
             expected_statuses={"ready", "completed", "thinking"},
         )
 
-        def respond(text, must_finish=False):
+        def respond(text, must_finish=False, release_rps_gesture=False):
             if must_finish or generation_is_current(generation):
-                enqueue_output(text, generation, language, must_finish=must_finish)
+                enqueue_output(
+                    text,
+                    generation,
+                    language,
+                    must_finish=must_finish,
+                    release_rps_gesture=release_rps_gesture,
+                )
             else:
+                if release_rps_gesture:
+                    release_rps_gesture_display()
                 logging.info("Discarding stale LLM output for generation %d", generation)
 
         logging.debug(f"user input from voice: {input_text}")
@@ -1789,32 +2527,78 @@ def gemini_task():
             logging.debug(f"ai_response end, delay = {ms_end - ms_start}ms")
             logging.debug("picture response end: {response}")
             respond(response)
-        elif "rock paper scissors" in decision_text:
+        elif decision_text == "capture rps gesture":
             ms_start = int(time.time() * 1000)
-            logging.debug(f"play game take photo")
+            logging.info("Rock-paper-scissors camera scoring started")
             human_image = media_api.take_photo()
-            logging.debug(f"play game take photo finish")
+            logging.debug("Rock-paper-scissors photo capture finished")
 
-            random.seed(int(time.time()))
+            if human_image is None:
+                logging.warning("Rock-paper-scissors camera returned no image")
+                respond(RPS_UNCLEAR_GESTURE.get(
+                    rps_game_lang,
+                    "I couldn't see your gesture. Please try again.",
+                ))
+                continue
+
             puppy_gesture = random.choice(RPS_GESTURES)
-            logging.debug(f"puppy_gesture is: {puppy_gesture}")
-            puppy_image = Image.open(f"{RES_DIR}/{puppy_gesture}.jpg")
-            image_queue.put(puppy_image)
+            show_rps_gesture(puppy_gesture)
 
-            human_gesture = google_api.ai_image_response(multi_model, image=human_image, text=user_input)
-            human_gesture = human_gesture.replace(' ', '')
-            logging.debug(f"human_gesture is: {human_gesture}")
+            vision_prompt = (
+                "Look only at the player's hand gesture. Respond with exactly "
+                "one lowercase word: rock, paper, scissors, or unknown. "
+                "No punctuation or explanation."
+            )
+            try:
+                raw_gesture = google_api.ai_image_response(
+                    multi_model,
+                    image=human_image,
+                    text=vision_prompt,
+                )
+            except Exception:
+                logging.exception(
+                    "Rock-paper-scissors vision request failed; treating the "
+                    "gesture as unknown"
+                )
+                raw_gesture = "unknown"
+            normalized_gesture = normalize_command_text(str(raw_gesture or ""))
+            human_gesture = get_rps_voice_move(
+                normalized_gesture,
+                allow_stt_aliases=True,
+            )
+            logging.info(
+                "Rock-paper-scissors vision result: raw=%r normalized=%r",
+                raw_gesture,
+                human_gesture,
+            )
 
             rps_round_pending = False
-            if RPS_WIN_CONDITIONS.get(human_gesture) == puppy_gesture:
+            if human_gesture is None:
+                result = RPS_UNCLEAR_GESTURE.get(
+                    rps_game_lang,
+                    "I couldn't see your gesture. Please try again.",
+                )
+            elif RPS_WIN_CONDITIONS.get(human_gesture) == puppy_gesture:
                 result = RPS_WIN.get(rps_game_lang, "You win!")
             elif human_gesture == puppy_gesture:
                 result = RPS_TIE.get(rps_game_lang, "It's a tie!")
             else:
                 result = RPS_LOSE.get(rps_game_lang, "You lose!")
-            respond(result, must_finish=True)
-            image = Image.open(f"{RES_DIR}/logo.png")
-            image_queue.put(image)
+            logging.info(
+                "Rock-paper-scissors scored: human=%s robot=%s result=%r",
+                human_gesture or "unknown",
+                puppy_gesture,
+                result,
+            )
+            logging.debug(
+                "Rock-paper-scissors camera scoring finished in %dms",
+                int(time.time() * 1000) - ms_start,
+            )
+            respond(
+                result,
+                must_finish=True,
+                release_rps_gesture=True,
+            )
 
         elif "what is this" in decision_text or ("what" in decision_text and "holding" in decision_text):
             ms_start = int(time.time() * 1000)
@@ -1840,10 +2624,8 @@ def gemini_task():
             response = shown_text
             respond(response)
 
-        elif "play" in decision_text and "heads up" in decision_text:
+        elif is_heads_up_start_command(decision_text, user_input):
             conversation.memory.clear()
-            init_input =  "From here on, always answer as if a human being is saying things off the top of his head which is always concise, relevant and contains a good conversational tone. so you will only and only answer in one breath responses, figuratively. If the input contains a language other than English, for example, language A, please answer the question in language A."
-            response = google_api.ai_text_response(conversation, init_input)
 
             ms_start = int(time.time() * 200)
             logging.debug(f"read take photo")
@@ -1853,31 +2635,26 @@ def gemini_task():
             shown_text = google_api.ai_image_response(multi_model,image=input_image, text="Tell me what the word on the paper is. Respond only with what is on the paper all in lowercase. Do not begin with a space. If there is no word on a card respond with 'no word' ")
             logging.debug(f"shown_text is: '{shown_text}'")
 
-            heads_up_word = shown_text
-            playing_heads_up = True
+            heads_up_word = str(shown_text or "").strip()
 
-            if "no word" in heads_up_word.lower():
+            if not heads_up_word or "no word" in heads_up_word.lower():
                 playing_heads_up = False
+                heads_up_game_language = None
                 logging.debug("no word on heads up card, ending heads up sequence")
-                respond(
-                    "No word was provided, ending heads up sequence",
-                    must_finish=True,
-                )
+                respond("No word was provided, ending heads up sequence")
                 continue
 
+            heads_up_game_language = language
+            playing_heads_up = True
             conversation.memory.clear()
 
-            heads_up_prompt = create_heads_up_prompt(heads_up_word)
+            heads_up_prompt = create_heads_up_prompt(heads_up_word, language.name)
+            ai_acknowledgement = heads_up_ready_text(language.name)
             conversation_history = [
-                HumanMessage(content=heads_up_prompt)
+                HumanMessage(content=heads_up_prompt),
+                AIMessage(content=ai_acknowledgement),
             ]
-
-            response = multi_model.invoke(conversation_history)
-            ai_acknowledgement = response.content
-            logging.debug(f"prompt creation response: {ai_acknowledgement}")
-            respond(ai_acknowledgement, must_finish=True)
-
-            conversation_history.append(AIMessage(content=ai_acknowledgement))
+            respond(ai_acknowledgement)
 
             guess_count = 0
 
@@ -1886,12 +2663,15 @@ def gemini_task():
                 input_text_queue.task_done()
                 if isinstance(queued_input, InputItem):
                     generation = queued_input.generation
-                    language = queued_input.language
+                    language = heads_up_game_language or queued_input.language
                     input_text = queued_input.text
                     decision_text = queued_input.command_text
                 else:
                     generation = get_current_generation()
-                    language = language_for_generation(generation)
+                    language = (
+                        heads_up_game_language or
+                        language_for_generation(generation)
+                    )
                     input_text = str(queued_input)
                     decision_text = normalize_command_text(input_text)
                 if not generation_is_current(generation):
@@ -1913,34 +2693,98 @@ def gemini_task():
                     ("stop" in decision_text and
                      ("game" in decision_text or "playing" in decision_text))):
                     playing_heads_up = False
-                    respond(
-                        "Okay, exiting the heads up game. Thanks for playing!",
-                        must_finish=True,
-                    )
+                    respond("Okay, exiting the heads up game. Thanks for playing!")
+                    heads_up_game_language = None
                     logging.debug("User requested to exit heads up game")
                     continue
 
-                conversation_history.append(HumanMessage(content=user_input))
-                response = multi_model.invoke(conversation_history)
-                ai_answer = response.content
+                user_question = user_input.strip()
+                if not user_question:
+                    logging.warning("Ignoring an empty Heads Up question")
+                    show_status_image("ready", expected_statuses={"thinking"})
+                    continue
+
+                model_question = user_question
+                if heads_up_requests_clue(decision_text):
+                    model_question = (
+                        "The player is ready. Give exactly one concise new clue "
+                        "about the secret word now. Do not say okay, do not "
+                        "acknowledge readiness, do not ask a question, and do "
+                        f"not reveal the word. Reply in {language.name}."
+                    )
+                    logging.info(
+                        "Mapped Heads Up acknowledgement %r to a clue request",
+                        user_question,
+                    )
+
+                conversation_history.append(HumanMessage(content=model_question))
+                try:
+                    response = multi_model.invoke(conversation_history)
+                    ai_answer = model_response_text(response)
+                    if not ai_answer:
+                        raise ValueError("Gemini returned empty content")
+                except Exception:
+                    # Remove the unanswered user turn so the next request has
+                    # a valid alternating history and the worker stays alive.
+                    conversation_history.pop()
+                    logging.exception("Heads Up answer generation failed")
+                    respond(heads_up_error_text(language.name))
+                    continue
                 logging.debug(f"ai answer: {ai_answer}")
+
+                if heads_up_answer_is_placeholder(ai_answer):
+                    # Do not synthesize model stage directions. They sound
+                    # especially chaotic and can themselves leak back into
+                    # STT as a new fake Heads Up turn.
+                    conversation_history.pop()
+                    logging.info(
+                        "Suppressing Heads Up placeholder response %r",
+                        ai_answer,
+                    )
+                    show_status_image("ready", expected_statuses={"thinking"})
+                    continue
 
                 guess_count+=1
 
                 conversation_history.append(AIMessage(content=ai_answer))
 
-                if "that's it!" in ai_answer.lower() and heads_up_word.lower() in ai_answer.lower():
+                if heads_up_answer_is_correct(ai_answer, heads_up_word):
                     respond(
-                        f"Congratulations! You guessed the word: {heads_up_word}, "
-                        f"in {guess_count} guesses!",
-                        must_finish=True,
+                        heads_up_success_text(
+                            language.name,
+                            heads_up_word,
+                            guess_count,
+                        )
                     )
                     playing_heads_up = False
+                    heads_up_game_language = None
                 else:
-                    respond(ai_answer, must_finish=True)
+                    respond(ai_answer)
         else:
             logging.debug("text response start!")
             response = google_api.ai_text_response(conversation, user_input)
+            if response_has_wrong_script(response, language):
+                # The model can follow the language of recent turns despite
+                # the per-turn instruction. Correct a clear script mismatch
+                # before TTS; otherwise, for example, an English answer is
+                # synthesized using the Chinese voice selected for the turn.
+                logging.warning(
+                    "Model response script does not match the %s turn; "
+                    "translating before TTS",
+                    language.name,
+                )
+                try:
+                    if response_translator is None:
+                        response_translator = CommandTranslator()
+                    response = response_translator.translate(
+                        response,
+                        CLOUD_TRANSLATE_TARGET_CODES[language.name],
+                    )
+                except Exception:
+                    logging.exception(
+                        "Could not translate mismatched model response to %s",
+                        language.name,
+                    )
             logging.debug("text response end: {response}")
             if generation_is_current(generation):
                 send_response(response, generation, language)
@@ -2073,18 +2917,32 @@ def tts_task_v8():
         if ((not generation_is_current(item.generation) and not item.must_finish) or
                 not ai_on):
             logging.info("Discarding stale/disabled TTS output for generation %d", item.generation)
+            if item.opens_rps_round:
+                finish_rps_countdown(False)
+            if item.release_rps_gesture:
+                release_rps_gesture_display()
             continue
 
         text = remove_asterisk_text(remove_emojis(item.text)).strip()
         if not text:
+            if item.opens_rps_round:
+                finish_rps_countdown(False)
+            if item.release_rps_gesture:
+                release_rps_gesture_display()
             show_status_image("ready", expected_statuses={"thinking"})
             continue
+        tts_language = language_for_tts_text(text, item.language)
+        if tts_language.name != item.language.name:
+            logging.info(
+                "TTS language corrected from %s to %s using response script",
+                item.language.name, tts_language.name,
+            )
         tts_interrupt_flag.clear()
         try:
             synthesis_started = time.monotonic()
             response = tts_client.synthesize_speech(
                 input=texttospeech.SynthesisInput(text=text),
-                voice=item.language.voice,
+                voice=tts_language.voice,
                 audio_config=audio_config,
             )
             synthesis_elapsed = time.monotonic() - synthesis_started
@@ -2102,17 +2960,27 @@ def tts_task_v8():
                 resample_elapsed, sample_rate,
             )
         except Exception:
-            logging.exception("TTS synthesis failed for language %s", item.language.name)
+            logging.exception("TTS synthesis failed for language %s", tts_language.name)
+            if item.opens_rps_round:
+                finish_rps_countdown(False)
+            if item.release_rps_gesture:
+                release_rps_gesture_display()
             show_status_image("ready", expected_statuses={"thinking"})
             continue
 
         if (not item.must_finish and
                 (not generation_is_current(item.generation) or tts_interrupt_flag.is_set())):
             logging.info("Discarding synthesized audio invalidated during cloud TTS")
+            if item.opens_rps_round:
+                finish_rps_countdown(False)
+            if item.release_rps_gesture:
+                release_rps_gesture_display()
             continue
 
         interrupted = False
         playback_failed = False
+        playback_started = time.monotonic()
+        playback_duration = len(samples) / sample_rate
         tts_playback_text = text
         tts_playback_started_at = time.monotonic()
         tts_active_event.set()
@@ -2122,7 +2990,7 @@ def tts_task_v8():
         )
         logging.info(
             "Speaking generation=%d language=%s duration=%.2fs",
-            item.generation, item.language.name, len(samples) / sample_rate,
+            item.generation, tts_language.name, playback_duration,
         )
         try:
             interrupted, callback_statuses = play_buffered_audio(
@@ -2145,24 +3013,49 @@ def tts_task_v8():
             playback_failed = True
             logging.exception("TTS playback failed")
         finally:
+            playback_fraction = min(
+                1.0,
+                (time.monotonic() - playback_started) / max(0.001, playback_duration),
+            )
             tts_active_event.clear()
             tts_playback_started_at = 0.0
             tts_playback_text = ""
-            show_status_image("ready", expected_statuses={"talking"})
+            if item.release_rps_gesture:
+                release_rps_gesture_display()
+            else:
+                show_status_image("ready", expected_statuses={"talking"})
 
         if interrupted:
+            if item.opens_rps_round:
+                if rps_input_mode() == "voice":
+                    accept_move = rps_move_window_reached(playback_fraction)
+                    finish_rps_countdown(accept_move)
+                    logging.info(
+                        "Rock-paper-scissors countdown interrupted at %.0f%%; "
+                        "voice move window %s",
+                        playback_fraction * 100,
+                        "opened" if accept_move else "closed",
+                    )
+                else:
+                    finish_rps_countdown(False)
+                    logging.info(
+                        "Rock-paper-scissors camera countdown interrupted at "
+                        "%.0f%%; capture cancelled",
+                        playback_fraction * 100,
+                    )
             logging.info("TTS generation %d interrupted by human speech", item.generation)
             continue
         if playback_failed:
+            if item.opens_rps_round:
+                finish_rps_countdown(False)
             continue
         logging.info("TTS generation %d playback completed", item.generation)
 
-        if item.text in ({GAME_TEXT} | set(GAME_TEXTS.values())) and generation_is_current(item.generation):
-            enqueue_input(
-                "I am playing rock paper scissors. Tell me what is this? rock paper or scissors? "
-                "Only in one word, no punctuation and all in lowercase.",
-                item.generation, item.language,
-            )
+        if item.opens_rps_round:
+            if rps_input_mode() == "camera":
+                queue_rps_camera_capture(item.generation, item.language)
+            else:
+                finish_rps_countdown(True)
 
 
 def gif_task():
