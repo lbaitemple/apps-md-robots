@@ -48,7 +48,8 @@ For an automated installation, provide the downloaded Google Cloud service
 account JSON to `update_os.sh`. Run the script as the normal audio user; it asks
 for `sudo` only when installing OS packages. It validates and copies the key to
 `.credentials/google-cloud.json`, restricts it to the current user, and updates
-`.env` automatically.
+`.env` automatically. It also enables the user's persistent systemd session and
+starts PipeWire, PipeWire-Pulse, and WirePlumber.
 
 ```bash
 cd ~/apps-md-robots
@@ -108,13 +109,15 @@ loginctl user-status "$USER"
 
 Both environment values should be populated. Log in locally as the audio user
 and run the app from that session. Do not launch it with `sudo`; a root or
-system-service process normally cannot access the user's PipeWire server. For
-an SSH-only/headless installation, enable a persistent user session once, then
-log out and back in:
+system-service process normally cannot access the user's PipeWire server.
+
+`update_os.sh` enables the persistent user session automatically. If it warns
+that it could not start PipeWire, log out and back in as the audio user, then
+restart the services and verify the PulseAudio compatibility server:
 
 ```bash
-sudo loginctl enable-linger "$USER"
 systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service
+pactl info
 ```
 
 For a manual setup, copy the supplied credential to the standard Gemini
