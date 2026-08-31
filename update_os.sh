@@ -124,36 +124,71 @@ if [[ ! -f ${env_file} && -f ${script_dir}/env.sample ]]; then
     install -m 600 -- "${script_dir}/env.sample" "${env_file}"
 fi
 
-env_tmp=$(mktemp "${script_dir}/.env.tmp.XXXXXX")
-chmod 600 -- "${env_tmp}"
-if [[ -f ${env_file} ]]; then
-    while IFS= read -r line || [[ -n ${line} ]]; do
-        [[ ${line} == API_KEY_PATH=* ]] || printf '%s\n' "${line}" >> "${env_tmp}"
-    done < "${env_file}"
-fi
-printf 'API_KEY_PATH=%s\n' "${credential_target}" >> "${env_tmp}"
-mv -- "${env_tmp}" "${env_file}"
-env_tmp=""
-
-audio_runtime_dir="/run/user/${UID}"
+audio_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${UID}}"
 audio_bus="unix:path=${audio_runtime_dir}/bus"
+pulse_socket="${audio_runtime_dir}/pulse/native"
+pulse_server="unix:${pulse_socket}"
 
-# SSH shells often lack these variables even though the user's systemd manager
-# is available through the standard runtime directory.
-if [[ -d ${audio_runtime_dir} && -S ${audio_runtime_dir}/bus ]]; then
-    export XDG_RUNTIME_DIR=${audio_runtime_dir}
-    export DBUS_SESSION_BUS_ADDRESS=${audio_bus}
+# libpulse locates the server through XDG_RUNTIME_DIR. A systemd system unit,
+# a sudo shell, and a non-login SSH shell all drop that variable, and libpulse
+# then reports "Connection refused" even though every package is installed and
+# the server is running. Pinning PULSE_SERVER to the socket path makes the
+# lookup independent of how the app is launched.
+export XDG_RUNTIME_DIR="${audio_runtime_dir}"
+export PULSE_SERVER="${pulse_server}"
+if [[ -S ${audio_runtime_dir}/bus ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="${audio_bus}"
 fi
 
 # Keep the user manager available after reboot for headless robot deployments.
 sudo loginctl enable-linger "${USER}"
 
-if systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service; then
-    echo "PipeWire user services enabled."
-else
-    echo "Warning: could not start PipeWire user services from this shell." >&2
-    echo "Log in locally as ${USER}, then run: systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service" >&2
+if [[ ! -S ${audio_runtime_dir}/bus ]]; then
+    echo "Error: no user session bus at ${audio_runtime_dir}/bus." >&2
+    echo "Neither systemctl --user nor pactl can work without it. Open a real" >&2
+    echo "login session as ${USER} (log in locally, or run" >&2
+    echo "'sudo machinectl shell ${USER}@'), then re-run this script." >&2
+    exit 1
 fi
+
+if ! systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service; then
+    echo "Error: could not start the PipeWire user services." >&2
+    systemctl --user --no-pager --lines=20 status pipewire-pulse.service >&2 || true
+    exit 1
+fi
+echo "PipeWire user services enabled."
+
+# pipewire-pulse creates the compatibility socket asynchronously after start.
+for _ in $(seq 1 20); do
+    [[ -S ${pulse_socket} ]] && break
+    sleep 0.25
+done
+if [[ ! -S ${pulse_socket} ]]; then
+    echo "Error: the PulseAudio compatibility socket never appeared at ${pulse_socket}." >&2
+    echo "Check 'systemctl --user status pipewire-pulse.service'." >&2
+    exit 1
+fi
+
+env_tmp=$(mktemp "${script_dir}/.env.tmp.XXXXXX")
+chmod 600 -- "${env_tmp}"
+if [[ -f ${env_file} ]]; then
+    while IFS= read -r line || [[ -n ${line} ]]; do
+        case ${line} in
+            API_KEY_PATH=*|XDG_RUNTIME_DIR=*|PULSE_SERVER=*) ;;
+            *) printf '%s\n' "${line}" >> "${env_tmp}" ;;
+        esac
+    done < "${env_file}"
+fi
+# ai_app8.py calls load_dotenv() before it shells out to pactl, and dotenv does
+# not overwrite variables that a real session already set, so these entries only
+# take effect when the launch context lacks them.
+{
+    printf 'API_KEY_PATH=%s\n' "${credential_target}"
+    printf 'XDG_RUNTIME_DIR=%s\n' "${audio_runtime_dir}"
+    printf 'PULSE_SERVER=%s\n' "${pulse_server}"
+} >> "${env_tmp}"
+mv -- "${env_tmp}" "${env_file}"
+env_tmp=""
 
 "${venv_dir}/bin/python" - <<'PY'
 import cv2
@@ -161,13 +196,23 @@ from api import media_api
 print(f"OpenCV {cv2.__version__} and media_api imported successfully")
 PY
 
-if pactl info >/dev/null 2>&1; then
-    echo "PipeWire PulseAudio compatibility is running."
+if ! pactl info >/dev/null 2>&1; then
+    echo "Error: the PipeWire services are running, but pactl cannot reach the audio server." >&2
+    echo "Audio environment: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}, PULSE_SERVER=${PULSE_SERVER}" >&2
+    echo "Try: systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service" >&2
+    exit 1
+fi
+
+# Checking pactl only with this shell's environment gives a false pass: an
+# interactive shell has XDG_RUNTIME_DIR, while a systemd unit or a sudo launch
+# does not. Verify the stripped environment the app is actually started in.
+if env -u XDG_RUNTIME_DIR -u DBUS_SESSION_BUS_ADDRESS \
+        PULSE_SERVER="${pulse_server}" pactl info >/dev/null 2>&1; then
+    echo "PulseAudio compatibility reachable with and without a session environment."
 else
-    echo "Warning: packages are installed, but pactl cannot reach the user audio server." >&2
-    echo "Run the app as ${USER} from the logged-in audio session, not with sudo." >&2
-    echo "Current audio environment: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}, DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-<unset>}" >&2
-    echo "After logging in, run: systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service" >&2
+    echo "Error: pactl works in this shell but fails with PULSE_SERVER=${pulse_server}." >&2
+    echo "The app would fail the same way when started from a service or with sudo." >&2
+    exit 1
 fi
 
 echo "Credential installed at ${credential_target} (mode 600)."
