@@ -135,8 +135,25 @@ printf 'API_KEY_PATH=%s\n' "${credential_target}" >> "${env_tmp}"
 mv -- "${env_tmp}" "${env_file}"
 env_tmp=""
 
-systemctl --user enable pipewire.socket pipewire-pulse.socket wireplumber.service
-systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service
+audio_runtime_dir="/run/user/${UID}"
+audio_bus="unix:path=${audio_runtime_dir}/bus"
+
+# SSH shells often lack these variables even though the user's systemd manager
+# is available through the standard runtime directory.
+if [[ -d ${audio_runtime_dir} && -S ${audio_runtime_dir}/bus ]]; then
+    export XDG_RUNTIME_DIR=${audio_runtime_dir}
+    export DBUS_SESSION_BUS_ADDRESS=${audio_bus}
+fi
+
+# Keep the user manager available after reboot for headless robot deployments.
+sudo loginctl enable-linger "${USER}"
+
+if systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service; then
+    echo "PipeWire user services enabled."
+else
+    echo "Warning: could not start PipeWire user services from this shell." >&2
+    echo "Log in locally as ${USER}, then run: systemctl --user enable --now pipewire.socket pipewire-pulse.socket wireplumber.service" >&2
+fi
 
 "${venv_dir}/bin/python" - <<'PY'
 import cv2
@@ -148,7 +165,9 @@ if pactl info >/dev/null 2>&1; then
     echo "PipeWire PulseAudio compatibility is running."
 else
     echo "Warning: packages are installed, but pactl cannot reach the user audio server." >&2
-    echo "Log in as ${USER}, then run: systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service" >&2
+    echo "Run the app as ${USER} from the logged-in audio session, not with sudo." >&2
+    echo "Current audio environment: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}, DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-<unset>}" >&2
+    echo "After logging in, run: systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service" >&2
 fi
 
 echo "Credential installed at ${credential_target} (mode 600)."
