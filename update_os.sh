@@ -92,6 +92,11 @@ else
     # The robot hardware drivers are installed system-wide by mini_pupper_bsp.
     python3 -m venv --upgrade --system-site-packages "${venv_dir}"
 fi
+# Guard against an existing venv retaining an isolated pyvenv.cfg.
+if ! grep -Eq '^include-system-site-packages = true$' "${venv_dir}/pyvenv.cfg"; then
+    echo "Error: ${venv_dir}/pyvenv.cfg does not enable system site packages." >&2
+    exit 1
+fi
 "${venv_dir}/bin/python" -m pip install --upgrade pip
 "${venv_dir}/bin/python" -m pip install -r "${script_dir}/requirements.txt"
 if [[ ! -f ${bsp_python_module}/setup.py ]]; then
