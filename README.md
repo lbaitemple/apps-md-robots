@@ -134,6 +134,16 @@ chmod 600 .env
 
 ## Run
 
+### if running in jupyter service
+
+add the following into `/etc/systemd/system/jupyterlab.service `
+
+```
+[Service]
+Environment="PULSE_SERVER=unix:/run/user/1000/pulse/native"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+```
+
 Activate the same virtual environment and run the desired demo as the logged-in
 audio user. For example:
 
