@@ -475,6 +475,8 @@ class WebRTCAudioRouting:
 
     def setup(self):
         if not self.enabled:
+            os.environ.pop("PULSE_SOURCE", None)
+            os.environ.pop("PULSE_SINK", None)
             logging.warning(
                 "ENABLE_TTS_BARGE_IN=0: using safe half-duplex mode; the "
                 "microphone will pause during TTS."
@@ -3126,7 +3128,7 @@ def main():
     logging.debug(f"init chdir: {current_dir}")
 
     from dotenv import load_dotenv
-    load_dotenv(dotenv_path='./.env')
+    load_dotenv(dotenv_path='./.env', override=True)
     audio_routing = WebRTCAudioRouting()
     try:
         audio_routing.setup()
