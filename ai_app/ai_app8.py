@@ -1002,7 +1002,7 @@ class NoiseRobustSTT:
         self.barge_in_max_gap_frames = (
             barge_in_max_gap_ms // self.vad_frame_duration_ms
         )
-        self.cancel_barge_in_on_vad = env_flag("BARGE_IN_CANCEL_ON_VAD", False)
+        self.cancel_barge_in_on_vad = env_flag("BARGE_IN_CANCEL_ON_VAD", True)
         self.barge_in_min_rms = max(0, int(os.environ.get("BARGE_IN_MIN_RMS", "120")))
         self.silence_threshold = int(os.environ.get("VAD_RMS_FALLBACK_THRESHOLD", "500"))
         pre_roll_ms = int(os.environ.get("PRE_ROLL_MS", "400"))
@@ -3163,7 +3163,7 @@ def main():
         "cancellation=%s",
         os.environ.get("BARGE_IN_CONFIRM_MS", "100"),
         os.environ.get("BARGE_IN_GUARD_MS", "80"),
-        "immediate" if env_flag("BARGE_IN_CANCEL_ON_VAD", False) else "after STT validation",
+        "immediate" if env_flag("BARGE_IN_CANCEL_ON_VAD", True) else "after STT validation",
     )
     logging.info("STT: Google Chirp 3 streaming with language identification")
     logging.info("Commands: Cloud Translation to English before deterministic action matching")
