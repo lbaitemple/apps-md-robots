@@ -86,6 +86,23 @@ sudo apt-get install -y \
     pipewire pipewire-pulse wireplumber libspa-0.2-modules \
     pulseaudio-utils libasound2-plugins
 
+# A "linux-image-raspi" upgrade does not pull in the matching linux-headers
+# package, so after a kernel bump the mini_pupper_bsp rpi-i2s-audio DKMS module
+# no longer builds: /etc/rc.local then retries "dkms autoinstall" on every boot
+# and "dkms status" stays mismatched against the running kernel. The module is
+# not what provides the microphone (that is "dtoverlay=googlevoicehat-soundcard"
+# in config.txt), but keep the headers in sync so DKMS stops failing.
+running_kernel=$(uname -r)
+if ! dpkg-query -W -f='${Status}' "linux-headers-${running_kernel}" 2>/dev/null \
+        | grep -q 'install ok installed'; then
+    echo "Installing kernel headers for ${running_kernel} so DKMS modules can build."
+    sudo apt-get install -y "linux-headers-${running_kernel}" \
+        || echo "Warning: linux-headers-${running_kernel} unavailable; DKMS modules will not build." >&2
+fi
+if command -v dkms >/dev/null 2>&1; then
+    sudo dkms autoinstall --kernelver "${running_kernel}" || true
+fi
+
 if [[ ! -x ${venv_dir}/bin/python ]]; then
     python3 -m venv --system-site-packages "${venv_dir}"
 else
@@ -169,12 +186,43 @@ if [[ ! -S ${pulse_socket} ]]; then
     exit 1
 fi
 
+# The Mini Pupper wires the speaker and the microphone to two different ALSA
+# cards. Playback goes to the Pi's bcm2835 PWM output, remapped to GPIO 12/13
+# by "dtoverlay=audremap,pins_12_13"; capture comes from the voiceHAT
+# (soc_sound) card, whose own output has no speaker attached. When PipeWire
+# picks the voiceHAT as the default sink after a reboot, ai_app8.py builds its
+# WebRTC AEC chain on top of it (it reads "pactl get-default-sink") and every
+# spoken reply is played into a dead output with no error anywhere. Pin both
+# ends so the routing never depends on PipeWire's choice.
+speaker_sink=""
+for _ in $(seq 1 20); do
+    speaker_sink=$(pactl list short sinks | awk '$2 ~ /bcm2835/ {print $2; exit}')
+    [[ -n ${speaker_sink} ]] && break
+    sleep 0.25
+done
+mic_source=$(pactl list short sources \
+    | awk '$2 ~ /soc_sound/ && $2 !~ /\.monitor$/ {print $2; exit}')
+if [[ -n ${speaker_sink} ]]; then
+    pactl set-default-sink "${speaker_sink}" || true
+else
+    speaker_sink=$(pactl get-default-sink)
+    echo "Warning: no bcm2835 speaker sink found; leaving the default sink as ${speaker_sink}." >&2
+fi
+if [[ -n ${mic_source} ]]; then
+    pactl set-default-source "${mic_source}" || true
+else
+    mic_source=$(pactl get-default-source)
+    echo "Warning: no soc_sound microphone source found; leaving the default source as ${mic_source}." >&2
+fi
+echo "Audio routing pinned: sink=${speaker_sink} source=${mic_source}"
+
 env_tmp=$(mktemp "${script_dir}/.env.tmp.XXXXXX")
 chmod 600 -- "${env_tmp}"
 if [[ -f ${env_file} ]]; then
     while IFS= read -r line || [[ -n ${line} ]]; do
         case ${line} in
             API_KEY_PATH=*|XDG_RUNTIME_DIR=*|PULSE_SERVER=*) ;;
+            AEC_MASTER_SINK=*|AEC_MASTER_SOURCE=*) ;;
             *) printf '%s\n' "${line}" >> "${env_tmp}" ;;
         esac
     done < "${env_file}"
@@ -186,6 +234,8 @@ fi
     printf 'API_KEY_PATH=%s\n' "${credential_target}"
     printf 'XDG_RUNTIME_DIR=%s\n' "${audio_runtime_dir}"
     printf 'PULSE_SERVER=%s\n' "${pulse_server}"
+    printf 'AEC_MASTER_SINK=%s\n' "${speaker_sink}"
+    printf 'AEC_MASTER_SOURCE=%s\n' "${mic_source}"
 } >> "${env_tmp}"
 mv -- "${env_tmp}" "${env_file}"
 env_tmp=""
